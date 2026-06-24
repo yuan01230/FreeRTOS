@@ -1,0 +1,29 @@
+# Build outputs
+build/
+cmake-build-*/
+*.elf
+*.map
+*.bin
+*.hex
+*.list
+*.o
+*.obj
+*.a
+
+# IDE/user-local files
+.idea/
+*.user
+*.uvguix.*
+*.uvoptx
+*.uvprojx
+
+# Accidental Windows-expanded path artifacts
+%SystemDrive%/
+
+# Logs and temporary files
+*.log
+*.tmp
+*.bak
+*.swp
+Thumbs.db
+desktop.ini
