@@ -111,6 +111,88 @@ cmake --build --preset Debug -j 6
 - 不要把局部变量指针直接丢进队列后马上返回。
 - 队列满时要处理返回值。
 
+### 阶段 2 实验记录：TFTLCD 队列满实验
+
+实验目标：
+
+```text
+观察生产者任务发送速度大于消费者任务处理速度时，队列如何被填满。
+理解 count、space、drops 的实际含义。
+```
+
+实验配置：
+
+```text
+lcdProducerTask：每 10ms 发送一条 LCD 显示消息。
+lcdTask：每消费一条消息后延时 500ms。
+lcdQueue：长度为 8。
+uartTask：每 1000ms 打印一次队列状态。
+```
+
+串口现象：
+
+```text
+[font] Init Flash... 0%
+[flash] id=0x6817 sr=0x00
+[font] Check Font... 0%
+[font] Font Ready 100%
+
+FreeRTOS queue TFTLCD demo start.
+[queue] tick=601 count=1 space=7 drops=0
+[queue] tick=1604 count=8 space=0 drops=91
+[queue] tick=2607 count=8 space=0 drops=189
+[queue] tick=3610 count=8 space=0 drops=288
+[queue] tick=4613 count=8 space=0 drops=386
+[queue] tick=5616 count=8 space=0 drops=484
+[queue] tick=6619 count=8 space=0 drops=583
+[queue] tick=7622 count=8 space=0 drops=681
+[queue] tick=8625 count=8 space=0 drops=779
+[queue] tick=9628 count=8 space=0 drops=877
+[queue] tick=10631 count=8 space=0 drops=976
+[queue] tick=11635 count=8 space=0 drops=1074
+```
+
+字段含义：
+
+```text
+count：当前队列中等待消费的消息数量。
+space：当前队列剩余可写入空间。
+drops：osMessageQueuePut() 发送失败次数。
+```
+
+现象分析：
+
+```text
+count=8 表示队列已经填满。
+space=0 表示队列没有剩余空间。
+drops 持续增加，表示 producerTask 继续发送消息，但队列已满，发送失败。
+```
+
+当前生产和消费速度：
+
+```text
+producerTask 每 10ms 生产一条消息，约每秒 100 条。
+lcdTask 每 500ms 消费一条消息，约每秒 2 条。
+```
+
+因此队列满后，每秒理论丢失消息数量约为：
+
+```text
+100 - 2 = 98 条
+```
+
+实际串口数据中，`drops` 每秒大约增加 98 到 99，和理论一致。
+
+实验结论：
+
+```text
+队列不是无限缓存。
+队列只能缓冲短时间的生产/消费速度差。
+当生产者长期快于消费者时，队列会被填满。
+如果 osMessageQueuePut() 的 timeout = 0，队列满时会立即返回失败。
+程序需要检查返回值，并根据业务决定丢弃、等待、覆盖旧消息或降低生产速度。
+```
+
 ## 阶段 3：同步机制：信号量和事件标志
 
 目标：理解“通知某件事发生了”和“传递数据”的区别。

@@ -687,3 +687,576 @@ FreeRTOS scheduler experiment
 ```text
 docs: add FreeRTOS day2 scheduler notes
 ```
+
+## 2026-07-12：第三天，任务通信：队列
+
+### 第 8 条：结合 TFTLCD 的实验模型
+
+原本的队列实验模型是：
+
+```text
+producerTask 产生 LED 控制消息
+ledControlTask 从队列取消息并控制 LED
+uartTask 打印实验状态
+```
+
+现在工程已经加入 TFTLCD、字库、EN25Q128、FatFs 等模块，所以第三天队列实验更适合改成：
+
+```text
+多个任务产生“显示消息”
+通过队列发送给 lcdTask
+lcdTask 统一从队列接收消息并刷新 TFTLCD
+```
+
+核心原则：
+
+```text
+不要让多个任务同时直接操作 TFTLCD。
+TFTLCD 属于共享外设，刷屏函数通常耗时较长，也不适合被多个任务交叉调用。
+先用一个 lcdTask 统一管理屏幕，其他任务只负责发送显示请求。
+```
+
+### 新实验模型
+
+任务设计：
+
+```text
+lcdTask：
+    初始化 TFTLCD。
+    初始化字库。
+    创建或等待显示消息队列。
+    阻塞等待队列消息。
+    收到消息后，统一刷新 LCD 指定区域。
+
+producerTask：
+    每 1000ms 产生一条显示消息。
+    消息内容包含 sequence、tick、显示行号、文本内容。
+    调用 osMessageQueuePut() 发送给 lcdTask。
+
+uartTask：
+    周期性打印队列状态。
+    可以打印当前 sequence、队列剩余空间、队列中消息数量。
+
+ledTask：
+    保留 LED 周期闪烁，用来证明其它任务仍在运行。
+```
+
+数据流：
+
+```text
+producerTask
+    |
+    | osMessageQueuePut()
+    v
+displayQueue
+    |
+    | osMessageQueueGet()
+    v
+lcdTask
+    |
+    v
+TFTLCD 显示
+```
+
+### 消息结构建议
+
+队列里传递的不是字符串指针，而是一个固定大小的结构体副本：
+
+```c
+typedef enum
+{
+    APP_LCD_MSG_STATUS = 0,
+    APP_LCD_MSG_TICK,
+    APP_LCD_MSG_LED,
+    APP_LCD_MSG_ERROR,
+} AppLcdMessageType_t;
+
+typedef struct
+{
+    AppLcdMessageType_t type;
+    uint32_t sequence;
+    uint32_t tick;
+    uint16_t x;
+    uint16_t y;
+    uint16_t color;
+    char text[48];
+} AppLcdMessage_t;
+```
+
+这样设计的原因：
+
+```text
+1. 队列发送时会复制整个 AppLcdMessage_t。
+2. text[48] 是结构体内部数组，不依赖发送任务的局部变量地址。
+3. lcdTask 收到的是一份完整消息副本，可以安全显示。
+4. type 字段用于区分状态消息、tick 消息、LED 消息、错误消息。
+```
+
+不建议这样做：
+
+```c
+typedef struct
+{
+    const char *text;
+} AppLcdMessage_t;
+```
+
+原因：
+
+```text
+如果 text 指向发送任务里的局部数组，发送任务循环下一次修改或函数返回后，
+lcdTask 可能读到已经变化或失效的数据。
+```
+
+### 队列创建建议
+
+```c
+static osMessageQueueId_t lcdQueueHandle;
+
+lcdQueueHandle = osMessageQueueNew(8, sizeof(AppLcdMessage_t), NULL);
+```
+
+含义：
+
+```text
+8：队列最多缓存 8 条 LCD 显示消息。
+sizeof(AppLcdMessage_t)：每条消息固定大小。
+NULL：使用默认队列属性。
+```
+
+### 发送任务模型
+
+```c
+static void App_Producer_Task(void *argument)
+{
+    AppLcdMessage_t msg;
+    uint32_t sequence = 0;
+
+    (void)argument;
+
+    for (;;)
+    {
+        sequence++;
+        msg.type = APP_LCD_MSG_TICK;
+        msg.sequence = sequence;
+        msg.tick = osKernelGetTickCount();
+        msg.x = 16;
+        msg.y = 164;
+        msg.color = BLACK;
+        snprintf(msg.text, sizeof(msg.text), "seq=%lu tick=%lu",
+                 (unsigned long)msg.sequence,
+                 (unsigned long)msg.tick);
+
+        (void)osMessageQueuePut(lcdQueueHandle, &msg, 0U, 0U);
+        osDelay(1000);
+    }
+}
+```
+
+这里要观察：
+
+```text
+producerTask 每 1000ms 发送一次消息。
+如果 lcdQueue 满了，timeout = 0 时发送会立即失败。
+后续实验可以专门检查 osMessageQueuePut() 的返回值。
+```
+
+### LCD 接收任务模型
+
+```c
+static void App_LCD_Task(void *argument)
+{
+    AppLcdMessage_t msg;
+
+    (void)argument;
+
+    TFTLCD_Init();
+    LCD_Clear(WHITE);
+
+    for (;;)
+    {
+        if (osMessageQueueGet(lcdQueueHandle, &msg, NULL, osWaitForever) == osOK)
+        {
+            FRONT_COLOR = msg.color;
+            LCD_Fill(msg.x, msg.y, 300, msg.y + 20, WHITE);
+            LCD_ShowString(msg.x, msg.y, 280, 20, 16, (uint8_t *)msg.text);
+        }
+    }
+}
+```
+
+这里要观察：
+
+```text
+队列为空时，lcdTask 阻塞在 osMessageQueueGet()。
+lcdTask 阻塞期间不会浪费 CPU。
+producerTask 放入消息后，lcdTask 被唤醒并刷新 TFTLCD。
+```
+
+### 为什么 TFTLCD 适合做队列实验
+
+TFTLCD 比 LED 更适合观察队列，因为它能直接显示消息内容：
+
+```text
+sequence 是否递增
+tick 是否变化
+消息类型是什么
+队列是否阻塞等待
+队列满时是否丢消息
+```
+
+但 TFTLCD 也更需要注意共享资源问题：
+
+```text
+LCD_Draw、LCD_ShowString、LCD_Fill 等函数都在操作同一个屏幕和同一组总线。
+如果多个任务同时调用这些函数，显示内容可能交叉、闪烁或覆盖。
+```
+
+所以第三天先采用最稳的结构：
+
+```text
+多个生产者任务可以发消息。
+只有一个 lcdTask 真正操作 TFTLCD。
+```
+
+### 第三天实验目标
+
+完成后应该能回答：
+
+```text
+1. 为什么 LCD 显示不建议由多个任务直接同时操作？
+2. 为什么队列里应该传 AppLcdMessage_t 副本，而不是局部字符串指针？
+3. lcdTask 阻塞等待队列时，CPU 是否还能运行其它任务？
+4. 如果 producerTask 发送太快，lcdQueue 满了会发生什么？
+```
+
+### 第三天实验结果记录
+
+串口启动阶段输出：
+
+```text
+[font] Init Flash... 0%
+[flash] id=0x6817 sr=0x00
+[font] Check Font... 0%
+[font] Font Ready 100%
+
+FreeRTOS queue TFTLCD demo start.
+```
+
+说明：
+
+```text
+EN25Q128 Flash 能正常读取到 ID。
+字库检查通过，Font Ready 100%。
+TFTLCD 队列实验任务启动成功。
+```
+
+队列运行阶段串口输出：
+
+```text
+[queue] tick=600 count=1 space=7 drops=0
+[queue] tick=1604 count=0 space=8 drops=0
+[queue] tick=2607 count=0 space=8 drops=0
+[queue] tick=3610 count=0 space=8 drops=0
+[queue] tick=4613 count=0 space=8 drops=0
+[queue] tick=5616 count=0 space=8 drops=0
+[queue] tick=6619 count=0 space=8 drops=0
+[queue] tick=7622 count=0 space=8 drops=0
+[queue] tick=8625 count=0 space=8 drops=0
+[queue] tick=9628 count=0 space=8 drops=0
+```
+
+LCD 屏幕现象：
+
+```text
+LCD 屏幕动态刷新 seq=xx，tick=xxxx。
+seq 和 tick 都逐渐递增。
+```
+
+字段含义：
+
+```text
+seq：
+    lcdProducerTask 生成 LCD 显示消息的序号。
+    每生成一条 AppLcdMessage_t，sequence 自增一次。
+
+tick：
+    生成这条显示消息时的系统 tick。
+
+count：
+    串口打印那一瞬间，lcdQueue 中还没被消费的消息数量。
+
+space：
+    lcdQueue 剩余可用空间。
+    当前队列长度是 8，所以 space=8 表示队列为空。
+
+drops：
+    lcdProducerTask 调用 osMessageQueuePut() 失败的次数。
+    drops=0 表示没有丢消息。
+```
+
+现象分析：
+
+```text
+第一条日志 count=1 space=7，说明串口打印时队列里刚好有 1 条消息还没被 lcdTask 取走。
+后续日志基本是 count=0 space=8，说明 lcdTask 消费消息很及时，队列没有积压。
+drops 始终为 0，说明 producerTask 发送消息没有失败。
+```
+
+本次实验结论：
+
+```text
+lcdProducerTask 每 1000ms 生成一条 AppLcdMessage_t。
+osMessageQueuePut() 把消息副本放入 lcdQueue。
+lcdTask 阻塞等待 lcdQueue。
+队列收到消息后，lcdTask 被唤醒并刷新 TFTLCD。
+当前生产速度和消费速度匹配，没有队列积压，也没有消息丢失。
+```
+
+### 队列后续需要掌握的注意事项
+
+#### 1. 队列满时的处理
+
+当前发送函数使用：
+
+```c
+osMessageQueuePut(lcdQueueHandle, &message, 0U, 0U);
+```
+
+最后一个参数是 `0U`，表示：
+
+```text
+如果队列满了，不等待，立即返回失败。
+```
+
+所以程序里用 `lcdProducerDropCount` 统计发送失败次数：
+
+```text
+drops=0：没有丢消息。
+drops 增加：生产者发送太快，队列已经满，消息被丢弃。
+```
+
+#### 2. timeout 参数
+
+`osMessageQueuePut()` 和 `osMessageQueueGet()` 都有 timeout 参数。
+
+常见写法：
+
+```c
+osMessageQueuePut(queue, &msg, 0, 0);
+```
+
+含义：
+
+```text
+不等待，队列满就立即失败。
+```
+
+```c
+osMessageQueuePut(queue, &msg, 0, 100);
+```
+
+含义：
+
+```text
+队列满时最多等待 100 tick。
+```
+
+```c
+osMessageQueueGet(queue, &msg, NULL, osWaitForever);
+```
+
+含义：
+
+```text
+队列为空时一直阻塞等待消息。
+```
+
+核心理解：
+
+```text
+timeout 决定任务是立即失败返回，还是进入 Blocked 等待。
+```
+
+#### 3. 队列传值，不要随便传危险指针
+
+当前消息结构中使用：
+
+```c
+char text[48];
+```
+
+这是安全的，因为队列发送时复制的是整个 `AppLcdMessage_t`，包括 `text` 数组内容。
+
+不推荐这样设计：
+
+```c
+typedef struct
+{
+    const char *text;
+} AppLcdMessage_t;
+```
+
+原因：
+
+```text
+如果 text 指向发送任务里的局部数组，发送任务下一次循环修改它，
+或者局部变量生命周期结束，lcdTask 读到的数据就可能异常。
+```
+
+#### 4. 多生产者，单消费者
+
+当前模型是：
+
+```text
+lcdProducerTask -> lcdQueue -> lcdTask
+```
+
+后续可以扩展为：
+
+```text
+sensorTask      -> lcdQueue
+keyTask         -> lcdQueue
+uartCommandTask -> lcdQueue
+timerTask       -> lcdQueue
+                     |
+                     v
+                  lcdTask
+```
+
+这类模型很适合 TFTLCD：
+
+```text
+多个任务都可以请求显示内容。
+但只有 lcdTask 真正操作 TFTLCD。
+```
+
+#### 5. 消息类型 type 的使用
+
+当前消息定义中已经预留：
+
+```c
+APP_LCD_MSG_STATUS
+APP_LCD_MSG_TICK
+APP_LCD_MSG_LED
+APP_LCD_MSG_ERROR
+```
+
+后续可以在 `lcdTask` 里根据 `type` 分发：
+
+```c
+switch (message->type)
+{
+case APP_LCD_MSG_TICK:
+    // 显示 tick
+    break;
+case APP_LCD_MSG_LED:
+    // 显示 LED 状态
+    break;
+case APP_LCD_MSG_ERROR:
+    // 显示错误信息
+    break;
+default:
+    break;
+}
+```
+
+这样队列传递的就不是单纯字符串，而是一个明确的“事件消息”。
+
+#### 6. 队列长度如何选择
+
+队列不是越长越好。
+
+```text
+队列太短：容易满，drops 增加。
+队列太长：占用更多 FreeRTOS heap。
+```
+
+队列内存占用大致和下面两个因素有关：
+
+```text
+队列长度 * 每条消息大小
+```
+
+例如：
+
+```c
+osMessageQueueNew(8, sizeof(AppLcdMessage_t), NULL);
+```
+
+表示队列内部至少要能缓存 8 个 `AppLcdMessage_t`。
+
+后续调试内存时，需要结合：
+
+```text
+configTOTAL_HEAP_SIZE
+xPortGetFreeHeapSize()
+```
+
+观察 FreeRTOS heap 是否足够。
+
+### 队列后续实验建议
+
+#### 实验 A：队列满实验
+
+实验目标：
+
+```text
+理解生产速度大于消费速度时，队列会逐渐填满。
+观察 count、space、drops 的变化。
+```
+
+实验设计：
+
+```text
+lcdProducerTask 每 10ms 发送一条 LCD 消息。
+lcdTask 每收到一条消息后，故意延时 500ms 再继续接收下一条。
+lcdQueue 长度保持为 8。
+uartTask 每 1000ms 打印 count、space、drops。
+```
+
+预期现象：
+
+```text
+count 会逐渐接近 8。
+space 会逐渐接近 0。
+drops 会开始增加。
+LCD 上的 seq 会跳号，因为部分消息发送失败被丢弃。
+```
+
+实验结论应该验证：
+
+```text
+如果生产者发送速度远快于消费者处理速度，队列只能暂存有限消息。
+当队列满且 timeout = 0 时，新消息会发送失败。
+```
+
+#### 实验 B：多消息类型实验
+
+实验目标：
+
+```text
+理解队列不只是传字符串，还可以传递带 type 的结构体事件。
+```
+
+实验设计：
+
+```text
+producerTask 轮流发送 TICK、LED、ERROR 三种消息。
+lcdTask 根据 message.type 把不同消息显示到不同区域。
+```
+
+预期现象：
+
+```text
+TICK 显示在 tick 区域。
+LED 状态显示在 LED 区域。
+ERROR 或模拟错误显示在错误区域。
+```
+
+实验结论应该验证：
+
+```text
+队列可以作为任务间的事件通道。
+消息结构体中的 type 字段可以帮助消费者区分不同业务。
+```
