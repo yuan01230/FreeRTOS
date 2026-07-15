@@ -10,10 +10,11 @@
 #define APP_LCD_QUEUE_LENGTH 8U
 /* 每条 LCD 显示消息携带的文本最大长度，直接作为结构体成员随队列复制。 */
 #define APP_LCD_TEXT_MAX     48U
-/* 队列实验模式：当前选择实验 A，用快速生产、慢速消费观察队列满。 */
+/* 队列实验模式：当前选择实验 B，用多生产者消息观察 type 分发。 */
 #define APP_QUEUE_EXPERIMENT_NORMAL      0U
 #define APP_QUEUE_EXPERIMENT_QUEUE_FULL  1U
-#define APP_QUEUE_EXPERIMENT             APP_QUEUE_EXPERIMENT_QUEUE_FULL
+#define APP_QUEUE_EXPERIMENT_MULTI_TYPE  2U
+#define APP_QUEUE_EXPERIMENT             APP_QUEUE_EXPERIMENT_MULTI_TYPE
 
 #if APP_QUEUE_EXPERIMENT == APP_QUEUE_EXPERIMENT_QUEUE_FULL
 /* 实验 A：生产者每 10ms 发一条消息，消费者每处理一条后延时 500ms。 */
@@ -55,6 +56,7 @@ static void App_UART_Task(void *argument);
 static void App_LCD_Task(void *argument);
 static void App_LCD_Producer_Task(void *argument);
 static void App_LCD_FontBootStatus(const char *stage, uint8_t percent, void *user);
+static void App_LCD_PostMessage(const AppLcdMessage_t *message);
 static void App_LCD_DrawMessage(const AppLcdMessage_t *message);
 
 static osThreadId_t led0TaskHandle;
@@ -120,12 +122,30 @@ void App_FreeRTOS_Init(void)
  */
 static void App_LED0_Task(void *argument)
 {
+#if APP_QUEUE_EXPERIMENT == APP_QUEUE_EXPERIMENT_MULTI_TYPE
+  AppLcdMessage_t message;
+  uint32_t toggle_count = 0U;
+#endif
+
   (void)argument;
 
   for (;;)
   {
     /* LED0 每 500ms 翻转一次，用来观察短周期任务 */
     App_LED_Toggle(APP_LED0);
+#if APP_QUEUE_EXPERIMENT == APP_QUEUE_EXPERIMENT_MULTI_TYPE
+    toggle_count++;
+    message.type = APP_LCD_MSG_LED;
+    message.sequence = toggle_count;
+    message.tick = osKernelGetTickCount();
+    message.x = 16U;
+    message.y = 196U;
+    message.color = BLUE;
+    snprintf(message.text, sizeof(message.text), "LED0 toggle=%lu tick=%lu",
+             (unsigned long)message.sequence,
+             (unsigned long)message.tick);
+    App_LCD_PostMessage(&message);
+#endif
     osDelay(500);
   }
 }
@@ -137,12 +157,30 @@ static void App_LED0_Task(void *argument)
  */
 static void App_LED1_Task(void *argument)
 {
+#if APP_QUEUE_EXPERIMENT == APP_QUEUE_EXPERIMENT_MULTI_TYPE
+  AppLcdMessage_t message;
+  uint32_t toggle_count = 0U;
+#endif
+
   (void)argument;
 
   for (;;)
   {
     /* LED1 每 1000ms 翻转一次，用来观察不同任务周期 */
     App_LED_Toggle(APP_LED1);
+#if APP_QUEUE_EXPERIMENT == APP_QUEUE_EXPERIMENT_MULTI_TYPE
+    toggle_count++;
+    message.type = APP_LCD_MSG_LED;
+    message.sequence = toggle_count;
+    message.tick = osKernelGetTickCount();
+    message.x = 16U;
+    message.y = 220U;
+    message.color = GREEN;
+    snprintf(message.text, sizeof(message.text), "LED1 toggle=%lu tick=%lu",
+             (unsigned long)message.sequence,
+             (unsigned long)message.tick);
+    App_LCD_PostMessage(&message);
+#endif
     osDelay(1000);
   }
 }
@@ -198,7 +236,6 @@ static void App_LCD_Producer_Task(void *argument)
 {
   AppLcdMessage_t message;
   uint32_t sequence = 0U;
-  osStatus_t status;
 
   (void)argument;
 
@@ -217,13 +254,36 @@ static void App_LCD_Producer_Task(void *argument)
              (unsigned long)message.tick);
 
     /* timeout = 0 表示队列满时不等待，立即返回失败，便于观察丢消息计数。 */
-    status = osMessageQueuePut(lcdQueueHandle, &message, 0U, 0U);
-    if (status != osOK)
-    {
-      lcdProducerDropCount++;
-    }
+    App_LCD_PostMessage(&message);
 
     osDelay(APP_LCD_PRODUCER_PERIOD_MS);
+  }
+}
+
+/**
+ * @brief 向 LCD 显示队列发送一条消息。
+ *
+ * 多个生产者任务统一调用该函数发送消息，当前 timeout = 0：
+ * - 队列有空间时，消息副本进入队列；
+ * - 队列满时，立即返回失败，并累计 drops。
+ *
+ * @param message 要发送的 LCD 显示消息。
+ * @retval 无。
+ */
+static void App_LCD_PostMessage(const AppLcdMessage_t *message)
+{
+  osStatus_t status;
+
+  if ((lcdQueueHandle == NULL) || (message == NULL))
+  {
+    lcdProducerDropCount++;
+    return;
+  }
+
+  status = osMessageQueuePut(lcdQueueHandle, message, 0U, 0U);
+  if (status != osOK)
+  {
+    lcdProducerDropCount++;
   }
 }
 
@@ -334,6 +394,7 @@ static void App_LCD_Task(void *argument)
   LCD_ShowTextUtf8(16U, 120U, 280U, 24U, "汉字显示 中文字库");
   LCD_DrawRectangle(10U, 12U, 310U, 150U);
   LCD_DrawRectangle(10U, 156U, 310U, 190U);
+  LCD_DrawRectangle(10U, 192U, 310U, 246U);
 
   for (;;)
   {
@@ -360,15 +421,46 @@ static void App_LCD_Task(void *argument)
 static void App_LCD_DrawMessage(const AppLcdMessage_t *message)
 {
   uint16_t y_end;
+  uint16_t x;
+  uint16_t y;
+  uint16_t color;
 
   if (message == NULL)
   {
     return;
   }
 
-  y_end = (uint16_t)(message->y + 20U);
+  x = message->x;
+  y = message->y;
+  color = message->color;
+
+  switch (message->type)
+  {
+    case APP_LCD_MSG_TICK:
+      x = 16U;
+      y = 164U;
+      color = BLACK;
+      break;
+
+    case APP_LCD_MSG_LED:
+      color = message->color;
+      break;
+
+    case APP_LCD_MSG_ERROR:
+      x = 16U;
+      y = 250U;
+      color = RED;
+      break;
+
+    case APP_LCD_MSG_STATUS:
+    default:
+      color = message->color;
+      break;
+  }
+
+  y_end = (uint16_t)(y + 20U);
   /* 先清除本行区域，再显示最新文本，避免旧字符残留。 */
-  LCD_Fill(message->x, message->y, 300U, y_end, WHITE);
-  FRONT_COLOR = message->color;
-  LCD_ShowString(message->x, message->y, 280U, 20U, 16U, (uint8_t *)message->text);
+  LCD_Fill(x, y, 300U, y_end, WHITE);
+  FRONT_COLOR = color;
+  LCD_ShowString(x, y, 280U, 20U, 16U, (uint8_t *)message->text);
 }

@@ -193,6 +193,110 @@ lcdTask 每 500ms 消费一条消息，约每秒 2 条。
 程序需要检查返回值，并根据业务决定丢弃、等待、覆盖旧消息或降低生产速度。
 ```
 
+### 阶段 2 实验记录：多生产者 LCD 队列实验
+
+实验目标：
+
+```text
+观察多个生产者任务向同一个 lcdQueue 发送不同类型消息。
+理解 lcdTask 作为高优先级单消费者如何阻塞等待、被消息唤醒、抢占运行、再阻塞。
+观察不同任务周期对队列消息产生频率的影响。
+```
+
+实验配置：
+
+```text
+lcdProducerTask：每 1000ms 发送 TICK 显示消息。
+led0Task：每 500ms 翻转 LED0，并发送 LED0 状态消息。
+led1Task：每 1000ms 翻转 LED1，并发送 LED1 状态消息。
+lcdTask：阻塞等待 lcdQueue，收到消息后统一刷新 TFTLCD。
+lcdQueue：长度为 8。
+uartTask：每 1000ms 打印 count、space、drops。
+```
+
+实验串口数据：
+
+```text
+[22:55:22.790]收←◆[font] Init Flash... 0%
+[flash] id=0x6817 sr=0x00
+[font] Check Font... 0%
+[font] Font Ready 100%
+
+[22:55:22.868]收←◆
+FreeRTOS queue TFTLCD demo start.
+[queue] tick=601 count=1 space=7 drops=0
+
+[22:55:23.873]收←◆[queue] tick=1604 count=0 space=8 drops=0
+
+[22:55:24.876]收←◆[queue] tick=2607 count=0 space=8 drops=0
+
+[22:55:25.879]收←◆[queue] tick=3610 count=0 space=8 drops=0
+
+[22:55:26.882]收←◆[queue] tick=4613 count=0 space=8 drops=0
+
+[22:55:27.885]收←◆[queue] tick=5616 count=0 space=8 drops=0
+
+[22:55:28.889]收←◆[queue] tick=6619 count=0 space=8 drops=0
+
+[22:55:29.891]收←◆[queue] tick=7622 count=0 space=8 drops=0
+
+[22:55:30.893]收←◆[queue] tick=8625 count=0 space=8 drops=0
+```
+
+LCD 现象：
+
+```text
+LCD 上 lcdProducerTask、led0Task、led1Task 对应区域的 tick 都在持续递增。
+LED0 toggle 计数约为 LED1 toggle 计数的 2 倍。
+```
+
+现象分析：
+
+```text
+LED0 任务使用 osDelay(500)，大约每 500ms 翻转一次 LED0，并发送一次 LED0 队列消息。
+LED1 任务使用 osDelay(1000)，大约每 1000ms 翻转一次 LED1，并发送一次 LED1 队列消息。
+因此相同时间内，LED0 的 toggle 次数大约是 LED1 的 2 倍。
+```
+
+任务优先级分析：
+
+```text
+lcdTask：高优先级。
+lcdProducerTask / uartTask：普通优先级。
+led0Task / led1Task：低优先级。
+```
+
+`lcdTask` 并不是一直占用 CPU 读取队列，而是阻塞在 `osMessageQueueGet(..., osWaitForever)` 上等待消息。
+
+当 `lcdProducerTask`、`led0Task` 或 `led1Task` 调用 `osMessageQueuePut()` 发送消息后，`lcdTask` 从 Blocked 状态进入 Ready 状态。由于 `lcdTask` 优先级最高，它会优先获得 CPU，取出队列消息并刷新 LCD。处理完成后，`lcdTask` 再次调用 `osMessageQueueGet()`；如果队列为空，它会重新进入 Blocked 状态。
+
+可以把 `lcdTask` 的运行过程理解成：
+
+```text
+Blocked 等待消息
+    ↓
+生产者发送队列消息
+    ↓
+lcdTask 变为 Ready
+    ↓
+lcdTask 高优先级抢占运行
+    ↓
+读取消息并刷新 LCD
+    ↓
+队列为空后再次 Blocked
+```
+
+实验结论：
+
+```text
+多个任务可以作为生产者向同一个队列发送不同类型的消息。
+lcdProducerTask 发送周期 TICK 消息。
+led0Task 和 led1Task 发送 LED 状态消息。
+lcdTask 作为唯一消费者，根据 message.type 和坐标信息统一刷新 TFTLCD。
+LED0 消息频率约为 LED1 的 2 倍，这是两个任务 osDelay() 周期不同导致的。
+串口中 count=0、space=8、drops=0，说明 lcdTask 消费及时，队列没有积压，也没有消息丢失。
+```
+
 ## 阶段 3：同步机制：信号量和事件标志
 
 目标：理解“通知某件事发生了”和“传递数据”的区别。
