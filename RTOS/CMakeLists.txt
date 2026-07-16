@@ -45,27 +45,14 @@ target_link_directories(${CMAKE_PROJECT_NAME} PRIVATE
 # Add sources to executable
 target_sources(${CMAKE_PROJECT_NAME} PRIVATE
     # Add user sources here
-        LIB/LED/app_led.c
         LIB/UART/app_uart.c
         LIB/App_FreeRtos/app_freertos.c
-    LIB/TFTLCD/tftlcd.c
-    LIB/TFTLCD/tftlcd_port.c
-    LIB/TFTLCD/tftlcd_hx8357dn.c
-    LIB/TFTLCD/tftlcd_font_zh.c
-    LIB/EN25Q128/EN25Q128.c
-    LIB/font_codec/font_codec.c
-    LIB/font_storage/font_storage.c
-    LIB/font_storage/font_boot.c
 )
 
 # Add include paths
 target_include_directories(${CMAKE_PROJECT_NAME} PRIVATE
     # Add user defined include paths
         LIB/App_FreeRtos
-    LIB/TFTLCD
-    LIB/EN25Q128
-    LIB/font_codec
-    LIB/font_storage
 )
 
 # Add project symbols (macros)

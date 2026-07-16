@@ -1,466 +1,312 @@
+/*
+ * ============================================================================
+ *                    FreeRTOS 队列 timeout 实验 C
+ * ============================================================================
+ *
+ * 【当前程序测试内容】
+ *
+ * 本程序专门观察消息队列在“队列满”和“队列空”时的等待行为：
+ *
+ *   1. PUT 测试：队列满时，生产者发送消息是否等待、成功或超时；
+ *   2. GET 测试：队列空时，消费者接收消息是否等待、成功或超时。
+ *
+ * 队列长度被设置为 1，便于快速制造边界条件。
+ * 程序通过串口输出实验结果，不再使用 LED、TFTLCD 或字库显示。
+ *
+ * 【如何切换 PUT / GET 测试】
+ *
+ * 修改下面的 APP_QUEUE_TEST_MODE，然后重新编译并烧录：
+ *
+ *   #define APP_QUEUE_TEST_MODE APP_QUEUE_TEST_PUT
+ *   // 测试队列满时的 osMessageQueuePut()
+ *
+ *   #define APP_QUEUE_TEST_MODE APP_QUEUE_TEST_GET
+ *   // 测试队列空时的 osMessageQueueGet()
+ *
+ * 【如何切换立即返回 / 等待超时】
+ *
+ * 修改 APP_QUEUE_WAIT_TICKS：
+ *
+ *   #define APP_QUEUE_WAIT_TICKS 0U
+ *   // 不等待，条件不满足时立即返回 osErrorResource
+ *
+ *   #define APP_QUEUE_WAIT_TICKS 500U
+ *   // 最多等待 500 tick，超时后返回 osErrorTimeout
+ *
+ *   #define APP_QUEUE_WAIT_TICKS 2000U
+ *   // 最多等待 2000 tick；当前默认值，通常可以等到对方任务完成操作
+ *
+ * 注意：timeout 的单位是 tick，不一定等于毫秒。
+ * 具体换算关系取决于 FreeRTOS 的 configTICK_RATE_HZ 配置。
+ *
+ * 【推荐测试顺序】
+ *
+ *   ① PUT + timeout=0：观察队列满时立即失败；
+ *   ② PUT + timeout=500：观察队列满时等待后超时；
+ *   ③ PUT + timeout=2000：观察消费者取走消息后发送成功；
+ *   ④ GET + timeout=0：观察队列空时立即失败；
+ *   ⑤ GET + timeout=500：观察等待消息后超时；
+ *   ⑥ GET + timeout=2000：观察生产者发送消息后接收成功。
+ *
+ * 每次只修改宏定义，重新编译、烧录，然后观察串口中的：
+ *   status=osOK             操作成功；
+ *   status=osErrorResource  timeout=0 时队列不可用，立即返回；
+ *   status=osErrorTimeout   等待指定 tick 后仍未满足条件；
+ *   elapsed                 本次队列 API 实际阻塞了多少 tick。
+ *
+ * ============================================================================
+ */
+
 #include "app_freertos.h"
-#include "../LED/app_led.h"
 #include "../UART/app_uart.h"
 #include "cmsis_os.h"
-#include "font_boot.h"
-#include "tftlcd.h"
 #include <stdio.h>
 
-/* LCD 显示消息队列长度：最多缓存 8 条待显示消息。 */
-#define APP_LCD_QUEUE_LENGTH 8U
-/* 每条 LCD 显示消息携带的文本最大长度，直接作为结构体成员随队列复制。 */
-#define APP_LCD_TEXT_MAX     48U
-/* 队列实验模式：当前选择实验 B，用多生产者消息观察 type 分发。 */
-#define APP_QUEUE_EXPERIMENT_NORMAL      0U
-#define APP_QUEUE_EXPERIMENT_QUEUE_FULL  1U
-#define APP_QUEUE_EXPERIMENT_MULTI_TYPE  2U
-#define APP_QUEUE_EXPERIMENT             APP_QUEUE_EXPERIMENT_MULTI_TYPE
-
-#if APP_QUEUE_EXPERIMENT == APP_QUEUE_EXPERIMENT_QUEUE_FULL
-/* 实验 A：生产者每 10ms 发一条消息，消费者每处理一条后延时 500ms。 */
-#define APP_LCD_PRODUCER_PERIOD_MS       10U
-#define APP_LCD_CONSUMER_DELAY_MS        500U
-#else
-/* 正常模式：生产和消费速度接近，用于观察无积压队列。 */
-#define APP_LCD_PRODUCER_PERIOD_MS       1000U
-#define APP_LCD_CONSUMER_DELAY_MS        0U
-#endif
-
-/* LCD 显示消息类型：后续可根据类型扩展不同显示区域或处理方式。 */
-typedef enum
-{
-  APP_LCD_MSG_STATUS = 0,
-  APP_LCD_MSG_TICK,
-  APP_LCD_MSG_LED,
-  APP_LCD_MSG_ERROR,
-} AppLcdMessageType_t;
-
-/* 队列中传递的 LCD 显示消息。
- * 注意：text 是结构体内部数组，队列发送时复制的是完整消息副本，
- * 不依赖发送任务中的局部字符串地址。
+/*
+ * 队列实验 C：测试队列满、队列空时的 timeout 行为。
+ *
+ * 这里故意把队列长度设置为 1：
+ *   - 放入第 1 条消息后，队列马上变满；
+ *   - 取出消息后，队列马上出现 1 个空位。
+ *
+ * 队列越短，越容易稳定地观察 osMessageQueuePut() 和
+ * osMessageQueueGet() 的阻塞、唤醒和超时过程。
  */
+#define APP_QUEUE_LENGTH         1U
+
+/* 实验模式：PUT 测试队列满时的发送，GET 测试队列空时的接收。 */
+#define APP_QUEUE_TEST_PUT       1U
+#define APP_QUEUE_TEST_GET       2U
+
+/* 修改此宏后重新编译、烧录，即可切换两种实验。 */
+#define APP_QUEUE_TEST_MODE      APP_QUEUE_TEST_GET
+
+/*
+ * 最长等待时间，单位是 tick，不一定等于毫秒。
+ * 例如系统 tick 周期为 1ms 时，2000 tick 才约等于 2000ms。
+ *   - timeout = 0：不等待，条件不满足时立即返回；
+ *   - timeout > 0：最多等待指定 tick 数；
+ *   - osWaitForever：一直等待，直到操作成功。
+ */
+#define APP_QUEUE_WAIT_TICKS     2000U
+
+/*
+ * GET 实验中，生产者延时一段时间后才发送消息；
+ * PUT 实验中，消费者延时一段时间后才取消息。
+ * 这样可以人为制造“队列空”和“队列满”。
+ */
+#define APP_QUEUE_RELEASE_TICKS  1000U
+
 typedef struct
 {
-  AppLcdMessageType_t type;
+  /* 用于区分每一轮实验产生的消息。 */
   uint32_t sequence;
-  uint32_t tick;
-  uint16_t x;
-  uint16_t y;
-  uint16_t color;
-  char text[APP_LCD_TEXT_MAX];
-} AppLcdMessage_t;
+} AppQueueMessage_t;
 
-static void App_LED0_Task(void *argument);
-static void App_LED1_Task(void *argument);
-static void App_UART_Task(void *argument);
-static void App_LCD_Task(void *argument);
-static void App_LCD_Producer_Task(void *argument);
-static void App_LCD_FontBootStatus(const char *stage, uint8_t percent, void *user);
-static void App_LCD_PostMessage(const AppLcdMessage_t *message);
-static void App_LCD_DrawMessage(const AppLcdMessage_t *message);
+static void App_QueueProducerTask(void *argument);
+static void App_QueueConsumerTask(void *argument);
+static const char *App_QueueStatusName(osStatus_t status);
+static void App_QueuePrintResult(const char *operation, uint32_t sequence,
+                                 osStatus_t status, uint32_t start_tick,
+                                 uint32_t end_tick);
 
-static osThreadId_t led0TaskHandle;
-static osThreadId_t led1TaskHandle;
-static osThreadId_t uartTaskHandle;
-static osThreadId_t lcdTaskHandle;
-static osThreadId_t lcdProducerTaskHandle;
-/* LCD 显示消息队列句柄，生产者任务写入消息，lcdTask 读取并刷新屏幕。 */
-static osMessageQueueId_t lcdQueueHandle;
-/* 记录生产者发送失败次数，用于观察队列满或发送异常的情况。 */
-static volatile uint32_t lcdProducerDropCount;
+/* 队列句柄：生产者和消费者通过它访问同一个消息队列。 */
+static osMessageQueueId_t appQueueHandle;
 
-static const osThreadAttr_t led0TaskAttributes = {
-  .name = "led0Task",
-  .stack_size = 128 * 4,
-  .priority = (osPriority_t) osPriorityLow,
-};
-
-static const osThreadAttr_t led1TaskAttributes = {
-  .name = "led1Task",
-  .stack_size = 128 * 4,
-  .priority = (osPriority_t) osPriorityLow,
-};
-
-static const osThreadAttr_t uartTaskAttributes = {
-  .name = "uartTask",
+/* 生产者优先级为 Normal，负责向队列发送消息。 */
+static const osThreadAttr_t queueProducerTaskAttributes = {
+  .name = "queueProducer",
   .stack_size = 256 * 4,
-  .priority = (osPriority_t) osPriorityNormal,
+  .priority = (osPriority_t)osPriorityNormal,
 };
 
-static const osThreadAttr_t lcdTaskAttributes = {
-  .name = "lcdTask",
-  .stack_size = 1024 * 4,
-  .priority = (osPriority_t) osPriorityHigh,
-};
-
-static const osThreadAttr_t lcdProducerTaskAttributes = {
-  .name = "lcdProducerTask",
-  .stack_size = 256 * 4,
-  .priority = (osPriority_t) osPriorityNormal,
-};
-
-/**
- * @brief 创建应用层 FreeRTOS 任务。
- *
- * 当前示例先创建 LCD/字库启动任务，字库准备完成后再创建 LED 和 UART 任务。
- *
- * @param 无。
- * @retval 无。
+/*
+ * 消费者优先级为 Low。
+ * PUT 实验中，生产者在队列满时阻塞，消费者仍然可以获得 CPU，
+ * 延时后取走消息并释放队列空间。
  */
+static const osThreadAttr_t queueConsumerTaskAttributes = {
+  .name = "queueConsumer",
+  .stack_size = 256 * 4,
+  .priority = (osPriority_t)osPriorityLow,
+};
+
 void App_FreeRTOS_Init(void)
 {
-  /* 先只创建 LCD/字库启动任务，字库准备完成后再创建其它业务任务。 */
-  lcdTaskHandle = osThreadNew(App_LCD_Task, NULL, &lcdTaskAttributes);
-
-  (void)lcdTaskHandle;
-}
-
-/**
- * @brief LED0 闪烁任务入口函数。
- * @param argument 任务参数，本示例未使用。
- * @retval 无。FreeRTOS 任务函数不应返回。
- */
-static void App_LED0_Task(void *argument)
-{
-#if APP_QUEUE_EXPERIMENT == APP_QUEUE_EXPERIMENT_MULTI_TYPE
-  AppLcdMessage_t message;
-  uint32_t toggle_count = 0U;
-#endif
-
-  (void)argument;
-
-  for (;;)
+  /*
+   * 创建一个“消息数量为 1、消息大小为结构体大小”的队列。
+   * 队列会复制消息内容，而不是保存 message 局部变量的地址。
+   */
+  appQueueHandle = osMessageQueueNew(APP_QUEUE_LENGTH, sizeof(AppQueueMessage_t), NULL);
+  if (appQueueHandle == NULL)
   {
-    /* LED0 每 500ms 翻转一次，用来观察短周期任务 */
-    App_LED_Toggle(APP_LED0);
-#if APP_QUEUE_EXPERIMENT == APP_QUEUE_EXPERIMENT_MULTI_TYPE
-    toggle_count++;
-    message.type = APP_LCD_MSG_LED;
-    message.sequence = toggle_count;
-    message.tick = osKernelGetTickCount();
-    message.x = 16U;
-    message.y = 196U;
-    message.color = BLUE;
-    snprintf(message.text, sizeof(message.text), "LED0 toggle=%lu tick=%lu",
-             (unsigned long)message.sequence,
-             (unsigned long)message.tick);
-    App_LCD_PostMessage(&message);
-#endif
-    osDelay(500);
+    /* 队列创建失败时无法继续进行实验。 */
+    App_UART_Print("[timeout] queue create failed\r\n");
+    return;
   }
+
+  /* 队列创建成功后，再创建生产者和消费者，避免任务访问无效队列。 */
+  osThreadNew(App_QueueProducerTask, NULL, &queueProducerTaskAttributes);
+  osThreadNew(App_QueueConsumerTask, NULL, &queueConsumerTaskAttributes);
 }
 
-/**
- * @brief LED1 闪烁任务入口函数。
- * @param argument 任务参数，本示例未使用。
- * @retval 无。FreeRTOS 任务函数不应返回。
+/*
+ * 生产者任务：负责调用 osMessageQueuePut() 发送消息。
+ *
+ * GET 模式：
+ *   生产者先延时 1000 tick，给消费者制造“空队列等待”的机会，
+ *   然后使用 timeout=0 发送一条消息。
+ *
+ * PUT 模式：
+ *   先放入第 1 条消息使队列变满；
+ *   再放入第 2 条消息，并使用 APP_QUEUE_WAIT_TICKS 等待队列空间。
+ *   消费者稍后取走第 1 条消息后，第 2 次发送可能被唤醒并成功。
  */
-static void App_LED1_Task(void *argument)
+static void App_QueueProducerTask(void *argument)
 {
-#if APP_QUEUE_EXPERIMENT == APP_QUEUE_EXPERIMENT_MULTI_TYPE
-  AppLcdMessage_t message;
-  uint32_t toggle_count = 0U;
-#endif
-
-  (void)argument;
-
-  for (;;)
-  {
-    /* LED1 每 1000ms 翻转一次，用来观察不同任务周期 */
-    App_LED_Toggle(APP_LED1);
-#if APP_QUEUE_EXPERIMENT == APP_QUEUE_EXPERIMENT_MULTI_TYPE
-    toggle_count++;
-    message.type = APP_LCD_MSG_LED;
-    message.sequence = toggle_count;
-    message.tick = osKernelGetTickCount();
-    message.x = 16U;
-    message.y = 220U;
-    message.color = GREEN;
-    snprintf(message.text, sizeof(message.text), "LED1 toggle=%lu tick=%lu",
-             (unsigned long)message.sequence,
-             (unsigned long)message.tick);
-    App_LCD_PostMessage(&message);
-#endif
-    osDelay(1000);
-  }
-}
-
-/**
- * @brief 串口打印任务入口函数。
- *
- * 该任务用于辅助观察队列实验状态，每 1 秒打印一次：
- * - 当前系统 tick；
- * - LCD 队列中已有消息数量；
- * - LCD 队列剩余空间；
- * - LCD 生产者任务发送失败次数。
- *
- * @param argument 任务参数，本示例未使用。
- * @retval 无。FreeRTOS 任务函数不应返回。
- */
-static void App_UART_Task(void *argument)
-{
-  char message[96];
-  uint32_t queue_count;
-  uint32_t queue_space;
-
-  (void)argument;
-
-  App_UART_Print("\r\nFreeRTOS queue TFTLCD demo start.\r\n");
-
-  for (;;)
-  {
-    /* 周期性观察队列状态：当前消息数、剩余空间、发送失败次数。 */
-    queue_count = (lcdQueueHandle != NULL) ? osMessageQueueGetCount(lcdQueueHandle) : 0U;
-    queue_space = (lcdQueueHandle != NULL) ? osMessageQueueGetSpace(lcdQueueHandle) : 0U;
-    snprintf(message, sizeof(message),
-             "[queue] tick=%lu count=%lu space=%lu drops=%lu\r\n",
-             (unsigned long)osKernelGetTickCount(),
-             (unsigned long)queue_count,
-             (unsigned long)queue_space,
-             (unsigned long)lcdProducerDropCount);
-    App_UART_Print(message);
-    osDelay(1000);
-  }
-}
-
-/**
- * @brief LCD 消息生产者任务。
- *
- * 该任务不直接操作 TFTLCD，只负责周期性生成 AppLcdMessage_t，
- * 然后通过 lcdQueueHandle 发送给 lcdTask。这样可以避免多个任务同时刷屏。
- *
- * @param argument 任务参数，本示例未使用。
- * @retval 无。FreeRTOS 任务函数不应返回。
- */
-static void App_LCD_Producer_Task(void *argument)
-{
-  AppLcdMessage_t message;
+  AppQueueMessage_t message;
   uint32_t sequence = 0U;
-
-  (void)argument;
-
-  for (;;)
-  {
-    /* 构造一条 tick 显示消息，消息内容会被 osMessageQueuePut() 复制进队列。 */
-    sequence++;
-    message.type = APP_LCD_MSG_TICK;
-    message.sequence = sequence;
-    message.tick = osKernelGetTickCount();
-    message.x = 16U;
-    message.y = 164U;
-    message.color = BLACK;
-    snprintf(message.text, sizeof(message.text), "seq=%lu tick=%lu",
-             (unsigned long)message.sequence,
-             (unsigned long)message.tick);
-
-    /* timeout = 0 表示队列满时不等待，立即返回失败，便于观察丢消息计数。 */
-    App_LCD_PostMessage(&message);
-
-    osDelay(APP_LCD_PRODUCER_PERIOD_MS);
-  }
-}
-
-/**
- * @brief 向 LCD 显示队列发送一条消息。
- *
- * 多个生产者任务统一调用该函数发送消息，当前 timeout = 0：
- * - 队列有空间时，消息副本进入队列；
- * - 队列满时，立即返回失败，并累计 drops。
- *
- * @param message 要发送的 LCD 显示消息。
- * @retval 无。
- */
-static void App_LCD_PostMessage(const AppLcdMessage_t *message)
-{
+  uint32_t start_tick;
+  uint32_t end_tick;
   osStatus_t status;
 
-  if ((lcdQueueHandle == NULL) || (message == NULL))
-  {
-    lcdProducerDropCount++;
-    return;
-  }
-
-  status = osMessageQueuePut(lcdQueueHandle, message, 0U, 0U);
-  if (status != osOK)
-  {
-    lcdProducerDropCount++;
-  }
-}
-
-/**
- * @brief 字库启动进度回调函数。
- *
- * FontBoot_EnsureReadyEx() 在挂载 SD 卡、检查字库、加载字库等阶段会调用该函数。
- * 本函数会把当前阶段和百分比显示到 TFTLCD，同时通过串口输出变化后的进度。
- *
- * @param stage 当前启动阶段文本，例如挂载、检查、加载等。
- * @param percent 当前阶段百分比，范围通常为 0 到 100。
- * @param user 用户自定义参数，本示例未使用。
- * @retval 无。
- */
-static void App_LCD_FontBootStatus(const char *stage, uint8_t percent, void *user)
-{
-  char percent_text[16];
-  char uart_text[64];
-  static const char *last_stage;
-  static uint8_t last_percent = 0xFFU;
-
-  (void)user;
-
-  LCD_Fill(16U, 56U, 280U, 96U, WHITE);
-  FRONT_COLOR = BLACK;
-  LCD_ShowString(16U, 56U, 220U, 20U, 16U, (uint8_t *)stage);
-  snprintf(percent_text, sizeof(percent_text), "%u%%", (unsigned int)percent);
-  LCD_ShowString(16U, 76U, 80U, 20U, 16U, (uint8_t *)percent_text);
-
-  if ((stage != last_stage) || (percent != last_percent))
-  {
-    snprintf(uart_text, sizeof(uart_text), "[font] %s %u%%\r\n",
-             stage, (unsigned int)percent);
-    App_UART_Print(uart_text);
-    last_stage = stage;
-    last_percent = percent;
-  }
-}
-
-/**
- * @brief LCD 主任务入口函数。
- *
- * 该任务负责：
- * 1. 初始化 TFTLCD；
- * 2. 启动并检查中文字库；
- * 3. 创建 LCD 显示消息队列；
- * 4. 创建 LED、UART、LCD 消息生产者任务；
- * 5. 阻塞等待 lcdQueueHandle 中的显示消息；
- * 6. 收到消息后统一调用 App_LCD_DrawMessage() 刷新 TFTLCD。
- *
- * 设计重点：只有 lcdTask 直接操作 TFTLCD，其它任务只能通过队列发送显示请求。
- *
- * @param argument 任务参数，本示例未使用。
- * @retval 无。FreeRTOS 任务函数不应返回。
- */
-static void App_LCD_Task(void *argument)
-{
-  AppLcdMessage_t message;
-  char font_status[48];
-  uint8_t sd_mounted = 0U;
-  FontBootResult font_result;
-
+  /* 本实验不使用任务参数。 */
   (void)argument;
+  message.sequence = 0U;
 
-  TFTLCD_Init();
-
-  BACK_COLOR = WHITE;
-  FRONT_COLOR = BLACK;
-  LCD_Clear(WHITE);
-
-  FRONT_COLOR = BLUE;
-  LCD_ShowString(16U, 20U, 220U, 24U, 16U, (uint8_t *)"FreeRTOS TFTLCD");
-
-  font_result = FontBoot_EnsureReadyEx(&sd_mounted, App_LCD_FontBootStatus, NULL);
-  snprintf(font_status, sizeof(font_status), "font:%s sd:%u",
-           FontBoot_ResultToString(font_result), (unsigned int)sd_mounted);
-  LCD_Fill(16U, 56U, 280U, 96U, WHITE);
-  FRONT_COLOR = BLACK;
-  LCD_ShowString(16U, 56U, 250U, 20U, 16U, (uint8_t *)font_status);
-
-  /* 字库和 LCD 初始化完成后再创建队列，后续所有 LCD 刷新请求都经由该队列进入 lcdTask。 */
-  lcdQueueHandle = osMessageQueueNew(APP_LCD_QUEUE_LENGTH, sizeof(AppLcdMessage_t), NULL);
-  if (lcdQueueHandle == NULL)
-  {
-    FRONT_COLOR = RED;
-    LCD_ShowString(16U, 88U, 260U, 24U, 16U, (uint8_t *)"lcd queue create failed");
-    for (;;)
-    {
-      osDelay(1000);
-    }
-  }
-
-  /* 队列创建成功后再启动业务任务，保证生产者发送消息时队列已经可用。 */
-  led0TaskHandle = osThreadNew(App_LED0_Task, NULL, &led0TaskAttributes);
-  led1TaskHandle = osThreadNew(App_LED1_Task, NULL, &led1TaskAttributes);
-  uartTaskHandle = osThreadNew(App_UART_Task, NULL, &uartTaskAttributes);
-  lcdProducerTaskHandle = osThreadNew(App_LCD_Producer_Task, NULL, &lcdProducerTaskAttributes);
-  (void)led0TaskHandle;
-  (void)led1TaskHandle;
-  (void)uartTaskHandle;
-  (void)lcdProducerTaskHandle;
-  (void)osThreadSetPriority(osThreadGetId(), osPriorityLow);
-
-  FRONT_COLOR = RED;
-  LCD_ShowTextUtf8(16U, 88U, 260U, 24U, "你好 FreeRTOS");
-
-  FRONT_COLOR = BLACK;
-  LCD_ShowTextUtf8(16U, 120U, 280U, 24U, "汉字显示 中文字库");
-  LCD_DrawRectangle(10U, 12U, 310U, 150U);
-  LCD_DrawRectangle(10U, 156U, 310U, 190U);
-  LCD_DrawRectangle(10U, 192U, 310U, 246U);
-
+#if APP_QUEUE_TEST_MODE == APP_QUEUE_TEST_GET
+  /* GET 模式：消费者先等待，生产者 1000 tick 后再提供消息。 */
+  App_UART_Print("\r\n[timeout] GET test start\r\n");
   for (;;)
   {
-    /* 队列为空时 lcdTask 阻塞在这里，不占用 CPU；收到消息后再刷新 TFTLCD。 */
-    if (osMessageQueueGet(lcdQueueHandle, &message, NULL, osWaitForever) == osOK)
-    {
-      App_LCD_DrawMessage(&message);
-#if APP_LCD_CONSUMER_DELAY_MS > 0U
-      /* 实验 A：故意降低 lcdTask 消费速度，观察队列逐渐填满和 drops 增加。 */
-      osDelay(APP_LCD_CONSUMER_DELAY_MS);
+    osDelay(APP_QUEUE_RELEASE_TICKS);
+    sequence++;
+    message.sequence = sequence;
+
+    /* timeout=0：队列有空间就立即成功，队列满就立即失败。 */
+    start_tick = osKernelGetTickCount();
+    status = osMessageQueuePut(appQueueHandle, &message, 0U, 0U);
+    end_tick = osKernelGetTickCount();
+    App_QueuePrintResult("put", sequence, status, start_tick, end_tick);
+    osDelay(3000U);
+  }
+#else
+  /* PUT 模式：连续发送两条消息，第二次发送专门测试等待行为。 */
+  App_UART_Print("\r\n[timeout] PUT test start\r\n");
+  for (;;)
+  {
+    sequence++;
+    message.sequence = sequence;
+
+    /* 清空上一轮可能遗留的消息，保证每轮实验从空队列开始。 */
+    osMessageQueueReset(appQueueHandle);
+
+    /* 第 1 条消息应立即进入队列，此时队列 count=1、space=0。 */
+    start_tick = osKernelGetTickCount();
+    status = osMessageQueuePut(appQueueHandle, &message, 0U, 0U);
+    end_tick = osKernelGetTickCount();
+    App_QueuePrintResult("put-1", sequence, status, start_tick, end_tick);
+
+    /*
+     * 第 2 条消息遇到满队列：
+     *   - 消费者在等待时间内取走消息：发送成功，elapsed 约为等待时间；
+     *   - 消费者一直没有取消息：等待 APP_QUEUE_WAIT_TICKS 后超时。
+     */
+    start_tick = osKernelGetTickCount();
+    status = osMessageQueuePut(appQueueHandle, &message, 0U, APP_QUEUE_WAIT_TICKS);
+    end_tick = osKernelGetTickCount();
+    App_QueuePrintResult("put-2", sequence, status, start_tick, end_tick);
+    osDelay(3000U);
+  }
 #endif
-    }
+}
+
+/*
+ * 消费者任务：负责调用 osMessageQueueGet() 接收消息。
+ *
+ * GET 模式中，队列一开始为空，消费者使用有限 timeout 等待生产者发送。
+ * PUT 模式中，消费者先延时，等生产者把队列填满后再取出消息，
+ * 从而让正在等待队列空间的生产者有机会继续运行。
+ */
+static void App_QueueConsumerTask(void *argument)
+{
+  AppQueueMessage_t message;
+  uint32_t sequence = 0U;
+  uint32_t start_tick;
+  uint32_t end_tick;
+  osStatus_t status;
+
+  (void)argument;
+  message.sequence = 0U;
+
+#if APP_QUEUE_TEST_MODE == APP_QUEUE_TEST_GET
+  /* GET 模式每轮开始前清空队列，确保接收操作确实面对空队列。 */
+  App_UART_Print("[timeout] consumer waits for an empty queue\r\n");
+  for (;;)
+  {
+    // osMessageQueueReset(appQueueHandle);
+    /* 队列为空时，消费者会阻塞，直到收到消息或等待超时。 */
+    start_tick = osKernelGetTickCount();
+    status = osMessageQueueGet(appQueueHandle, &message, NULL, APP_QUEUE_WAIT_TICKS);
+    end_tick = osKernelGetTickCount();
+    App_QueuePrintResult("get", ++sequence, status, start_tick, end_tick);
+    osDelay(3000U);
+  }
+#else
+  /* PUT 模式中，延时用于故意保持队列满一段时间。 */
+  App_UART_Print("[timeout] consumer releases queue after 1000 ticks\r\n");
+  for (;;)
+  {
+    osDelay(APP_QUEUE_RELEASE_TICKS);
+    /* timeout=0：只尝试一次，不等待队列中的消息。 */
+    start_tick = osKernelGetTickCount();
+    status = osMessageQueueGet(appQueueHandle, &message, NULL, 0U);
+    end_tick = osKernelGetTickCount();
+    App_QueuePrintResult("get", message.sequence, status, start_tick, end_tick);
+    osDelay(3000U);
+  }
+#endif
+}
+
+static const char *App_QueueStatusName(osStatus_t status)
+{
+  /* 把 CMSIS-RTOS2 的数值返回值转换成容易阅读的字符串。 */
+  switch (status)
+  {
+    case osOK:
+      return "osOK";             /* 操作成功。 */
+    case osErrorResource:
+      return "osErrorResource";  /* timeout=0 时资源不可用，例如队列满或空。 */
+    case osErrorTimeout:
+      return "osErrorTimeout";   /* 等待了指定时间，但条件仍未满足。 */
+    default:
+      return "osErrorOther";     /* 其它错误，例如参数或中断上下文错误。 */
   }
 }
 
-/**
- * @brief 根据 LCD 显示消息刷新屏幕。
+/*
+ * 统一打印一次队列操作的结果。
  *
- * 只有 lcdTask 调用该函数，避免多个任务同时操作 TFTLCD 造成显示交叉或总线冲突。
- *
- * @param message 从 lcdQueueHandle 收到的显示消息副本。
- * @retval 无。
+ * 日志只保留最关键的字段：
+ *   op      操作类型，例如 put-1、put-2、get；
+ *   seq     消息序号；
+ *   status  操作返回值；
+ *   elapsed 实际阻塞时间，单位为 tick；
+ *   count   当前队列中已有的消息数量；
+ *   space   当前队列剩余空间。
  */
-static void App_LCD_DrawMessage(const AppLcdMessage_t *message)
+static void App_QueuePrintResult(const char *operation, uint32_t sequence,
+                                 osStatus_t status, uint32_t start_tick,
+                                 uint32_t end_tick)
 {
-  uint16_t y_end;
-  uint16_t x;
-  uint16_t y;
-  uint16_t color;
+  char text[160];
+  uint32_t count = osMessageQueueGetCount(appQueueHandle);
+  uint32_t space = osMessageQueueGetSpace(appQueueHandle);
 
-  if (message == NULL)
-  {
-    return;
-  }
-
-  x = message->x;
-  y = message->y;
-  color = message->color;
-
-  switch (message->type)
-  {
-    case APP_LCD_MSG_TICK:
-      x = 16U;
-      y = 164U;
-      color = BLACK;
-      break;
-
-    case APP_LCD_MSG_LED:
-      color = message->color;
-      break;
-
-    case APP_LCD_MSG_ERROR:
-      x = 16U;
-      y = 250U;
-      color = RED;
-      break;
-
-    case APP_LCD_MSG_STATUS:
-    default:
-      color = message->color;
-      break;
-  }
-
-  y_end = (uint16_t)(y + 20U);
-  /* 先清除本行区域，再显示最新文本，避免旧字符残留。 */
-  LCD_Fill(x, y, 300U, y_end, WHITE);
-  FRONT_COLOR = color;
-  LCD_ShowString(x, y, 280U, 20U, 16U, (uint8_t *)message->text);
+  snprintf(text, sizeof(text),
+           "[timeout] op=%s seq=%lu status=%s elapsed=%lu count=%lu space=%lu\r\n",
+           operation, (unsigned long)sequence, App_QueueStatusName(status),
+           (unsigned long)(end_tick - start_tick),
+           (unsigned long)count, (unsigned long)space);
+  App_UART_Print(text);
 }
