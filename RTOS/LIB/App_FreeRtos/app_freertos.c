@@ -1,58 +1,42 @@
 /*
  * ============================================================================
- *                    FreeRTOS 队列 timeout 实验 C
+ *                    FreeRTOS 队列实验 D：传递指针
  * ============================================================================
  *
  * 【当前程序测试内容】
  *
- * 本程序专门观察消息队列在“队列满”和“队列空”时的等待行为：
+ * 本实验观察“队列传值”和“队列传指针”的区别。
  *
- *   1. PUT 测试：队列满时，生产者发送消息是否等待、成功或超时；
- *   2. GET 测试：队列空时，消费者接收消息是否等待、成功或超时。
+ * 实验 C 中，队列元素大小是 sizeof(AppQueueMessage_t)，队列保存的是
+ * 结构体内容副本。
  *
- * 队列长度被设置为 1，便于快速制造边界条件。
- * 程序通过串口输出实验结果，不再使用 LED、TFTLCD 或字库显示。
+ * 当前实验 D 中，队列元素大小是 sizeof(AppQueueMessage_t *)，队列保存的是
+ * 指针变量的值，也就是一个地址。消费者通过这个地址访问生产者准备好的
+ * 静态消息对象。
  *
- * 【如何切换 PUT / GET 测试】
+ * 【本实验要验证什么】
  *
- * 修改下面的 APP_QUEUE_TEST_MODE，然后重新编译并烧录：
+ *   1. 生产者发送的是消息对象地址；
+ *   2. 消费者接收到的地址与生产者发送的地址一致；
+ *   3. 队列本身只复制“指针值”，不会复制指针指向的整块数据；
+ *   4. 指针指向的数据必须在消费者使用期间一直有效。
  *
- *   #define APP_QUEUE_TEST_MODE APP_QUEUE_TEST_PUT
- *   // 测试队列满时的 osMessageQueuePut()
+ * 【如何切换不同测试】
  *
- *   #define APP_QUEUE_TEST_MODE APP_QUEUE_TEST_GET
- *   // 测试队列空时的 osMessageQueueGet()
+ * 当前文件只运行实验 D。前面实验 C 的 timeout 测试结果已经整理到
+ * RTOS/README.md 中。
  *
- * 【如何切换立即返回 / 等待超时】
+ * 后续如果要继续做实验 E，可以在本文件基础上增加“静态消息池”：
+ *   - freeQueue：保存空闲消息块指针；
+ *   - dataQueue：保存待处理消息块指针。
  *
- * 修改 APP_QUEUE_WAIT_TICKS：
+ * 【重要提醒】
  *
- *   #define APP_QUEUE_WAIT_TICKS 0U
- *   // 不等待，条件不满足时立即返回 osErrorResource
+ * 不要把局部变量地址放进队列后让任务继续运行或函数返回。
+ * 局部变量的生命周期不稳定，消费者拿到的指针可能已经失效。
  *
- *   #define APP_QUEUE_WAIT_TICKS 500U
- *   // 最多等待 500 tick，超时后返回 osErrorTimeout
- *
- *   #define APP_QUEUE_WAIT_TICKS 2000U
- *   // 最多等待 2000 tick；当前默认值，通常可以等到对方任务完成操作
- *
- * 注意：timeout 的单位是 tick，不一定等于毫秒。
- * 具体换算关系取决于 FreeRTOS 的 configTICK_RATE_HZ 配置。
- *
- * 【推荐测试顺序】
- *
- *   ① PUT + timeout=0：观察队列满时立即失败；
- *   ② PUT + timeout=500：观察队列满时等待后超时；
- *   ③ PUT + timeout=2000：观察消费者取走消息后发送成功；
- *   ④ GET + timeout=0：观察队列空时立即失败；
- *   ⑤ GET + timeout=500：观察等待消息后超时；
- *   ⑥ GET + timeout=2000：观察生产者发送消息后接收成功。
- *
- * 每次只修改宏定义，重新编译、烧录，然后观察串口中的：
- *   status=osOK             操作成功；
- *   status=osErrorResource  timeout=0 时队列不可用，立即返回；
- *   status=osErrorTimeout   等待指定 tick 后仍未满足条件；
- *   elapsed                 本次队列 API 实际阻塞了多少 tick。
+ * 本实验使用 static 全局消息对象，生命周期覆盖整个程序运行过程，
+ * 因此适合用来安全观察“队列传指针”的基本行为。
  *
  * ============================================================================
  */
@@ -60,71 +44,69 @@
 #include "app_freertos.h"
 #include "../UART/app_uart.h"
 #include "cmsis_os.h"
+#include <stdint.h>
 #include <stdio.h>
 
 /*
- * 队列实验 C：测试队列满、队列空时的 timeout 行为。
+ * 队列长度仍然设置为 1。
  *
- * 这里故意把队列长度设置为 1：
- *   - 放入第 1 条消息后，队列马上变满；
- *   - 取出消息后，队列马上出现 1 个空位。
- *
- * 队列越短，越容易稳定地观察 osMessageQueuePut() 和
- * osMessageQueueGet() 的阻塞、唤醒和超时过程。
+ * 这样串口日志更容易分析：
+ *   - 生产者每次只放入一个消息指针；
+ *   - 消费者取走后，队列重新变空；
+ *   - count 和 space 的变化非常直观。
  */
-#define APP_QUEUE_LENGTH         1U
-
-/* 实验模式：PUT 测试队列满时的发送，GET 测试队列空时的接收。 */
-#define APP_QUEUE_TEST_PUT       1U
-#define APP_QUEUE_TEST_GET       2U
-
-/* 修改此宏后重新编译、烧录，即可切换两种实验。 */
-#define APP_QUEUE_TEST_MODE      APP_QUEUE_TEST_GET
+#define APP_QUEUE_LENGTH              1U
 
 /*
- * 最长等待时间，单位是 tick，不一定等于毫秒。
- * 例如系统 tick 周期为 1ms 时，2000 tick 才约等于 2000ms。
- *   - timeout = 0：不等待，条件不满足时立即返回；
- *   - timeout > 0：最多等待指定 tick 数；
- *   - osWaitForever：一直等待，直到操作成功。
+ * 生产者发送两次消息之间的间隔。
+ * 间隔稍微拉长，可以让串口日志一轮一轮地输出，方便观察。
  */
-#define APP_QUEUE_WAIT_TICKS     2000U
-
-/*
- * GET 实验中，生产者延时一段时间后才发送消息；
- * PUT 实验中，消费者延时一段时间后才取消息。
- * 这样可以人为制造“队列空”和“队列满”。
- */
-#define APP_QUEUE_RELEASE_TICKS  1000U
+#define APP_POINTER_SEND_PERIOD_TICKS 2000U
 
 typedef struct
 {
-  /* 用于区分每一轮实验产生的消息。 */
+  /*
+   * sequence 用来区分第几条消息。
+   * 消费者收到指针后，会通过指针读取这个字段。
+   */
   uint32_t sequence;
+
+  /*
+   * created_tick 记录生产者填写消息时的系统 tick。
+   * 它不是队列 API 必须字段，只是帮助我们确认消费者读到的是同一块数据。
+   */
+  uint32_t created_tick;
 } AppQueueMessage_t;
 
 static void App_QueueProducerTask(void *argument);
 static void App_QueueConsumerTask(void *argument);
 static const char *App_QueueStatusName(osStatus_t status);
-static void App_QueuePrintResult(const char *operation, uint32_t sequence,
-                                 osStatus_t status, uint32_t start_tick,
-                                 uint32_t end_tick);
+static void App_QueuePrintPut(uint32_t sequence, const AppQueueMessage_t *message,
+                              osStatus_t status);
+static void App_QueuePrintGet(uint32_t receive_count, const AppQueueMessage_t *message,
+                              osStatus_t status);
 
-/* 队列句柄：生产者和消费者通过它访问同一个消息队列。 */
+/* 队列句柄：本实验的队列元素类型是 AppQueueMessage_t *。 */
 static osMessageQueueId_t appQueueHandle;
 
-/* 生产者优先级为 Normal，负责向队列发送消息。 */
+/*
+ * 静态消息对象。
+ *
+ * 这是本实验最关键的对象：
+ *   - 生产者不会把整个结构体复制进队列；
+ *   - 生产者只把 &staticMessage 这个地址放进队列；
+ *   - 消费者收到地址后，再通过这个地址读取 sequence 和 created_tick。
+ *
+ * 因为它是 static 全局变量，所以生命周期从程序启动持续到程序结束。
+ */
+static AppQueueMessage_t staticMessage;
+
 static const osThreadAttr_t queueProducerTaskAttributes = {
   .name = "queueProducer",
   .stack_size = 256 * 4,
   .priority = (osPriority_t)osPriorityNormal,
 };
 
-/*
- * 消费者优先级为 Low。
- * PUT 实验中，生产者在队列满时阻塞，消费者仍然可以获得 CPU，
- * 延时后取走消息并释放队列空间。
- */
 static const osThreadAttr_t queueConsumerTaskAttributes = {
   .name = "queueConsumer",
   .stack_size = 256 * 4,
@@ -134,179 +116,156 @@ static const osThreadAttr_t queueConsumerTaskAttributes = {
 void App_FreeRTOS_Init(void)
 {
   /*
-   * 创建一个“消息数量为 1、消息大小为结构体大小”的队列。
-   * 队列会复制消息内容，而不是保存 message 局部变量的地址。
+   * 注意第二个参数：
+   *
+   *   sizeof(AppQueueMessage_t *)
+   *
+   * 这表示队列里每个元素只保存“一个指针大小”的数据。
+   * 如果这里写成 sizeof(AppQueueMessage_t)，就又变成实验 C 的结构体传值了。
    */
-  appQueueHandle = osMessageQueueNew(APP_QUEUE_LENGTH, sizeof(AppQueueMessage_t), NULL);
+  appQueueHandle = osMessageQueueNew(APP_QUEUE_LENGTH,
+                                     sizeof(AppQueueMessage_t *),
+                                     NULL);
   if (appQueueHandle == NULL)
   {
-    /* 队列创建失败时无法继续进行实验。 */
-    App_UART_Print("[timeout] queue create failed\r\n");
+    App_UART_Print("[ptr] queue create failed\r\n");
     return;
   }
 
-  /* 队列创建成功后，再创建生产者和消费者，避免任务访问无效队列。 */
+  App_UART_Print("\r\n[ptr] experiment D start: queue stores AppQueueMessage_t *\r\n");
+  App_UART_Print("[ptr] expected: put_addr == get_addr == static_addr\r\n");
+
   osThreadNew(App_QueueProducerTask, NULL, &queueProducerTaskAttributes);
   osThreadNew(App_QueueConsumerTask, NULL, &queueConsumerTaskAttributes);
 }
 
 /*
- * 生产者任务：负责调用 osMessageQueuePut() 发送消息。
+ * 生产者任务：填写静态消息对象，然后把对象地址发送到队列。
  *
- * GET 模式：
- *   生产者先延时 1000 tick，给消费者制造“空队列等待”的机会，
- *   然后使用 timeout=0 发送一条消息。
+ * 这里有一个容易看错的细节：
  *
- * PUT 模式：
- *   先放入第 1 条消息使队列变满；
- *   再放入第 2 条消息，并使用 APP_QUEUE_WAIT_TICKS 等待队列空间。
- *   消费者稍后取走第 1 条消息后，第 2 次发送可能被唤醒并成功。
+ *   AppQueueMessage_t *message_ptr = &staticMessage;
+ *   osMessageQueuePut(appQueueHandle, &message_ptr, 0U, 0U);
+ *
+ * message_ptr 本身是一个局部变量，但队列复制的是 message_ptr 里面保存的地址值。
+ * 只要这个地址指向的 staticMessage 仍然有效，消费者就可以安全访问。
  */
 static void App_QueueProducerTask(void *argument)
 {
-  AppQueueMessage_t message;
+  AppQueueMessage_t *message_ptr;
   uint32_t sequence = 0U;
-  uint32_t start_tick;
-  uint32_t end_tick;
   osStatus_t status;
 
-  /* 本实验不使用任务参数。 */
   (void)argument;
-  message.sequence = 0U;
 
-#if APP_QUEUE_TEST_MODE == APP_QUEUE_TEST_GET
-  /* GET 模式：消费者先等待，生产者 1000 tick 后再提供消息。 */
-  App_UART_Print("\r\n[timeout] GET test start\r\n");
-  for (;;)
-  {
-    osDelay(APP_QUEUE_RELEASE_TICKS);
-    sequence++;
-    message.sequence = sequence;
-
-    /* timeout=0：队列有空间就立即成功，队列满就立即失败。 */
-    start_tick = osKernelGetTickCount();
-    status = osMessageQueuePut(appQueueHandle, &message, 0U, 0U);
-    end_tick = osKernelGetTickCount();
-    App_QueuePrintResult("put", sequence, status, start_tick, end_tick);
-    osDelay(3000U);
-  }
-#else
-  /* PUT 模式：连续发送两条消息，第二次发送专门测试等待行为。 */
-  App_UART_Print("\r\n[timeout] PUT test start\r\n");
   for (;;)
   {
     sequence++;
-    message.sequence = sequence;
 
-    /* 清空上一轮可能遗留的消息，保证每轮实验从空队列开始。 */
-    osMessageQueueReset(appQueueHandle);
-
-    /* 第 1 条消息应立即进入队列，此时队列 count=1、space=0。 */
-    start_tick = osKernelGetTickCount();
-    status = osMessageQueuePut(appQueueHandle, &message, 0U, 0U);
-    end_tick = osKernelGetTickCount();
-    App_QueuePrintResult("put-1", sequence, status, start_tick, end_tick);
+    staticMessage.sequence = sequence;
+    staticMessage.created_tick = osKernelGetTickCount();
+    message_ptr = &staticMessage;
 
     /*
-     * 第 2 条消息遇到满队列：
-     *   - 消费者在等待时间内取走消息：发送成功，elapsed 约为等待时间；
-     *   - 消费者一直没有取消息：等待 APP_QUEUE_WAIT_TICKS 后超时。
+     * timeout=0：
+     *   队列有空间就立即发送；
+     *   队列满则立即返回 osErrorResource。
+     *
+     * 当前生产周期较慢，消费者一直阻塞等待，所以正常情况下应返回 osOK。
      */
-    start_tick = osKernelGetTickCount();
-    status = osMessageQueuePut(appQueueHandle, &message, 0U, APP_QUEUE_WAIT_TICKS);
-    end_tick = osKernelGetTickCount();
-    App_QueuePrintResult("put-2", sequence, status, start_tick, end_tick);
-    osDelay(3000U);
+    status = osMessageQueuePut(appQueueHandle, &message_ptr, 0U, 0U);
+    App_QueuePrintPut(sequence, message_ptr, status);
+
+    osDelay(APP_POINTER_SEND_PERIOD_TICKS);
   }
-#endif
 }
 
 /*
- * 消费者任务：负责调用 osMessageQueueGet() 接收消息。
+ * 消费者任务：从队列中取出一个指针，再通过指针读取消息内容。
  *
- * GET 模式中，队列一开始为空，消费者使用有限 timeout 等待生产者发送。
- * PUT 模式中，消费者先延时，等生产者把队列填满后再取出消息，
- * 从而让正在等待队列空间的生产者有机会继续运行。
+ * osWaitForever 表示消费者没有消息时一直阻塞等待。
+ * 阻塞期间任务不会一直占用 CPU。
  */
 static void App_QueueConsumerTask(void *argument)
 {
-  AppQueueMessage_t message;
-  uint32_t sequence = 0U;
-  uint32_t start_tick;
-  uint32_t end_tick;
+  AppQueueMessage_t *message_ptr = NULL;
+  uint32_t receive_count = 0U;
   osStatus_t status;
 
   (void)argument;
-  message.sequence = 0U;
 
-#if APP_QUEUE_TEST_MODE == APP_QUEUE_TEST_GET
-  /* GET 模式每轮开始前清空队列，确保接收操作确实面对空队列。 */
-  App_UART_Print("[timeout] consumer waits for an empty queue\r\n");
   for (;;)
   {
-    // osMessageQueueReset(appQueueHandle);
-    /* 队列为空时，消费者会阻塞，直到收到消息或等待超时。 */
-    start_tick = osKernelGetTickCount();
-    status = osMessageQueueGet(appQueueHandle, &message, NULL, APP_QUEUE_WAIT_TICKS);
-    end_tick = osKernelGetTickCount();
-    App_QueuePrintResult("get", ++sequence, status, start_tick, end_tick);
-    osDelay(3000U);
+    message_ptr = NULL;
+    status = osMessageQueueGet(appQueueHandle, &message_ptr, NULL, osWaitForever);
+    receive_count++;
+
+    App_QueuePrintGet(receive_count, message_ptr, status);
   }
-#else
-  /* PUT 模式中，延时用于故意保持队列满一段时间。 */
-  App_UART_Print("[timeout] consumer releases queue after 1000 ticks\r\n");
-  for (;;)
-  {
-    osDelay(APP_QUEUE_RELEASE_TICKS);
-    /* timeout=0：只尝试一次，不等待队列中的消息。 */
-    start_tick = osKernelGetTickCount();
-    status = osMessageQueueGet(appQueueHandle, &message, NULL, 0U);
-    end_tick = osKernelGetTickCount();
-    App_QueuePrintResult("get", message.sequence, status, start_tick, end_tick);
-    osDelay(3000U);
-  }
-#endif
 }
 
 static const char *App_QueueStatusName(osStatus_t status)
 {
-  /* 把 CMSIS-RTOS2 的数值返回值转换成容易阅读的字符串。 */
   switch (status)
   {
     case osOK:
-      return "osOK";             /* 操作成功。 */
+      return "osOK";
     case osErrorResource:
-      return "osErrorResource";  /* timeout=0 时资源不可用，例如队列满或空。 */
+      return "osErrorResource";
     case osErrorTimeout:
-      return "osErrorTimeout";   /* 等待了指定时间，但条件仍未满足。 */
+      return "osErrorTimeout";
     default:
-      return "osErrorOther";     /* 其它错误，例如参数或中断上下文错误。 */
+      return "osErrorOther";
   }
 }
 
-/*
- * 统一打印一次队列操作的结果。
- *
- * 日志只保留最关键的字段：
- *   op      操作类型，例如 put-1、put-2、get；
- *   seq     消息序号；
- *   status  操作返回值；
- *   elapsed 实际阻塞时间，单位为 tick；
- *   count   当前队列中已有的消息数量；
- *   space   当前队列剩余空间。
- */
-static void App_QueuePrintResult(const char *operation, uint32_t sequence,
-                                 osStatus_t status, uint32_t start_tick,
-                                 uint32_t end_tick)
+static void App_QueuePrintPut(uint32_t sequence, const AppQueueMessage_t *message,
+                              osStatus_t status)
 {
-  char text[160];
+  char text[192];
   uint32_t count = osMessageQueueGetCount(appQueueHandle);
   uint32_t space = osMessageQueueGetSpace(appQueueHandle);
 
   snprintf(text, sizeof(text),
-           "[timeout] op=%s seq=%lu status=%s elapsed=%lu count=%lu space=%lu\r\n",
-           operation, (unsigned long)sequence, App_QueueStatusName(status),
-           (unsigned long)(end_tick - start_tick),
-           (unsigned long)count, (unsigned long)space);
+           "[ptr] op=put seq=%lu status=%s put_addr=0x%08lX count=%lu space=%lu\r\n",
+           (unsigned long)sequence,
+           App_QueueStatusName(status),
+           (unsigned long)(uintptr_t)message,
+           (unsigned long)count,
+           (unsigned long)space);
+  App_UART_Print(text);
+}
+
+static void App_QueuePrintGet(uint32_t receive_count, const AppQueueMessage_t *message,
+                              osStatus_t status)
+{
+  char text[224];
+  uint32_t count = osMessageQueueGetCount(appQueueHandle);
+  uint32_t space = osMessageQueueGetSpace(appQueueHandle);
+
+  if ((status == osOK) && (message != NULL))
+  {
+    snprintf(text, sizeof(text),
+             "[ptr] op=get rx=%lu status=%s get_addr=0x%08lX static_addr=0x%08lX seq=%lu tick=%lu count=%lu space=%lu\r\n",
+             (unsigned long)receive_count,
+             App_QueueStatusName(status),
+             (unsigned long)(uintptr_t)message,
+             (unsigned long)(uintptr_t)&staticMessage,
+             (unsigned long)message->sequence,
+             (unsigned long)message->created_tick,
+             (unsigned long)count,
+             (unsigned long)space);
+  }
+  else
+  {
+    snprintf(text, sizeof(text),
+             "[ptr] op=get rx=%lu status=%s get_addr=0x%08lX count=%lu space=%lu\r\n",
+             (unsigned long)receive_count,
+             App_QueueStatusName(status),
+             (unsigned long)(uintptr_t)message,
+             (unsigned long)count,
+             (unsigned long)space);
+  }
+
   App_UART_Print(text);
 }

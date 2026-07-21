@@ -1,12 +1,12 @@
 # FreeRTOS 队列实验工程
 
-本目录是 STM32F407 + FreeRTOS 学习工程，当前章节主要学习 FreeRTOS 的消息队列（Message Queue）以及队列操作的 timeout 行为。
+本目录是 STM32F407 + FreeRTOS 学习工程，当前章节主要学习 FreeRTOS 的消息队列（Message Queue）、队列操作的 timeout 行为，以及队列传递指针时的生命周期问题。
 
 当前实验代码位于：
 
 `LIB/App_FreeRtos/app_freertos.c`
 
-串口用于输出实验结果，当前 timeout 实验不再使用 LED、TFTLCD 和中文字库。
+串口用于输出实验结果，当前队列实验不再使用 LED、TFTLCD 和中文字库。
 
 ## 当前章节学习目标
 
@@ -14,6 +14,8 @@
 
 - 队列用于任务之间传递数据。
 - 队列保存的是消息副本，不是发送任务中局部变量的地址。
+- 队列既可以保存结构体副本，也可以保存指针值。
+- 传递指针时，必须保证指针指向的数据生命周期足够长。
 - 队列有固定容量，不是无限缓存。
 - 队列满时，发送任务可以立即失败、阻塞等待，或等待超时。
 - 队列空时，接收任务可以立即失败、阻塞等待，或等待超时。
@@ -55,7 +57,7 @@ osKernelStart() 之前
 
 ## 队列基本概念
 
-当前队列创建代码：
+实验 C 的队列创建代码：
 
 ```c
 appQueueHandle =
@@ -104,6 +106,17 @@ osMessageQueuePut(queue, &message, 0U, 0U);
 
 队列不会保存 message 局部变量的地址，而是把消息内容复制到队列内部。
 
+实验 D 的队列创建代码：
+
+```c
+appQueueHandle =
+    osMessageQueueNew(APP_QUEUE_LENGTH,
+                      sizeof(AppQueueMessage_t *),
+                      NULL);
+```
+
+这表示队列里每个元素只保存一个 `AppQueueMessage_t *` 指针。队列复制的是地址值，不会复制地址指向的整块结构体内容。
+
 ## timeout 参数
 
 timeout 的单位是 tick，不一定等于毫秒。
@@ -150,9 +163,9 @@ timeout = osWaitForever;
 LIB/App_FreeRtos/app_freertos.c
 ```
 
-### 切换 PUT / GET 模式
+### 实验 C：切换 PUT / GET 模式
 
-PUT 模式测试“队列满时发送”：
+如果源码使用实验 C 的 timeout 程序，PUT 模式测试“队列满时发送”：
 
 ```c
 #define APP_QUEUE_TEST_MODE APP_QUEUE_TEST_PUT
@@ -196,6 +209,18 @@ GET + timeout=0
 GET + timeout=500
 GET + timeout=2000
 ```
+
+### 实验 D：当前程序
+
+当前 `LIB/App_FreeRtos/app_freertos.c` 已切换为实验 D：队列传递指针。
+
+当前程序不再通过 `APP_QUEUE_TEST_MODE` 切换 PUT / GET timeout 测试，而是固定运行：
+
+```text
+实验 D：生产者发送 AppQueueMessage_t *，消费者接收 AppQueueMessage_t *
+```
+
+如需回看实验 C，不需要重新做实验；本 README 已保留实验 C 的六组测试结果和分析。
 
 ## PUT 实验：队列满时的 timeout
 
@@ -315,6 +340,143 @@ put-2 返回 osErrorTimeout。
 | GET | 500 | 队列空，500 tick 内无消息 | 返回 osErrorTimeout |
 | GET | 2000 | 队列空，等待期间收到消息 | 返回 osOK |
 
+## 实验 D：队列传递指针
+
+### 实验目的
+
+前面的实验 C 传递的是结构体副本：
+
+```c
+osMessageQueueNew(APP_QUEUE_LENGTH, sizeof(AppQueueMessage_t), NULL);
+osMessageQueuePut(appQueueHandle, &message, 0U, timeout);
+```
+
+实验 D 改成传递结构体指针：
+
+```c
+osMessageQueueNew(APP_QUEUE_LENGTH, sizeof(AppQueueMessage_t *), NULL);
+osMessageQueuePut(appQueueHandle, &message_ptr, 0U, 0U);
+```
+
+这两个写法很像，但含义完全不同：
+
+| 方式 | 队列元素大小 | 队列保存的内容 |
+| --- | --- | --- |
+| 传结构体 | `sizeof(AppQueueMessage_t)` | 结构体内容副本 |
+| 传指针 | `sizeof(AppQueueMessage_t *)` | 一个地址值 |
+
+### 当前实验设计
+
+程序中定义了一个静态消息对象：
+
+```c
+static AppQueueMessage_t staticMessage;
+```
+
+生产者任务每隔一段时间填写这个静态对象：
+
+```c
+staticMessage.sequence = sequence;
+staticMessage.created_tick = osKernelGetTickCount();
+message_ptr = &staticMessage;
+```
+
+然后把 `message_ptr` 这个指针值放入队列：
+
+```c
+osMessageQueuePut(appQueueHandle, &message_ptr, 0U, 0U);
+```
+
+消费者任务从队列取出指针：
+
+```c
+osMessageQueueGet(appQueueHandle, &message_ptr, NULL, osWaitForever);
+```
+
+消费者再通过这个指针读取消息内容：
+
+```c
+message_ptr->sequence
+message_ptr->created_tick
+```
+
+### 预期串口日志
+
+典型日志格式：
+
+```text
+[ptr] experiment D start: queue stores AppQueueMessage_t *
+[ptr] expected: put_addr == get_addr == static_addr
+[ptr] op=put seq=1 status=osOK put_addr=0x20000000 count=1 space=0
+[ptr] op=get rx=1 status=osOK get_addr=0x20000000 static_addr=0x20000000 seq=1 tick=123 count=0 space=1
+```
+
+实际地址不一定是 `0x20000000`，要以板子输出为准。
+
+### 实测串口结果
+
+本次实测回显：
+
+```text
+[ptr] experiment D start: queue stores AppQueueMessage_t *
+[ptr] expected: put_addr == get_addr == static_addr
+[ptr] op=put seq=1 status=osOK put_addr=0x20004E78 count=1 space=0
+[ptr] op=get rx=1 status=osOK get_addr=0x20004E78 static_addr=0x20004E78 seq=1 tick=0 count=0 space=1
+
+[ptr] op=put seq=2 status=osOK put_addr=0x20004E78 count=1 space=0
+[ptr] op=get rx=2 status=osOK get_addr=0x20004E78 static_addr=0x20004E78 seq=2 tick=2005 count=0 space=1
+
+[ptr] op=put seq=3 status=osOK put_addr=0x20004E78 count=1 space=0
+[ptr] op=get rx=3 status=osOK get_addr=0x20004E78 static_addr=0x20004E78 seq=3 tick=4010 count=0 space=1
+```
+
+实测结论：
+
+- `put_addr`、`get_addr`、`static_addr` 都是 `0x20004E78`，说明队列传递的是同一个静态消息对象地址。
+- `seq` 从 1 递增到 3，说明消费者通过指针读到了生产者更新后的消息内容。
+- `tick` 约每 2000 tick 增加一次，与 `APP_POINTER_SEND_PERIOD_TICKS` 的配置一致。
+- put 后 `count=1 space=0`，get 后 `count=0 space=1`，说明队列中保存的是一个指针元素，消费者取走后队列重新变空。
+
+分析重点：
+
+- `put_addr` 是生产者发送的消息对象地址。
+- `get_addr` 是消费者从队列中取出的地址。
+- `static_addr` 是静态消息对象的真实地址。
+- 正常情况下三者应相同。
+- `seq` 是消费者通过指针读到的消息序号。
+- `count=0 space=1` 表示消费者取走指针后，队列重新变空。
+
+### 为什么不能发送局部变量地址
+
+下面这种写法不适合直接用于任务间传指针：
+
+```c
+static void Producer(void)
+{
+    AppQueueMessage_t message;
+    AppQueueMessage_t *message_ptr = &message;
+
+    osMessageQueuePut(queue, &message_ptr, 0U, 0U);
+}
+```
+
+原因是 `message` 是局部变量。任务继续运行、函数返回，或者下一轮循环重新使用这块栈空间后，消费者拿到的地址可能已经不再代表原来的消息内容。
+
+实验 D 使用 `staticMessage`，是因为它的生命周期覆盖整个程序运行过程。这样可以先安全观察“队列只保存指针值”的行为。
+
+### 实验 D 的局限
+
+当前实验只有一个静态消息对象，适合学习指针传递的基本原理。
+
+如果生产者发送很快，消费者处理很慢，单个静态对象可能在消费者使用前被生产者覆盖。真实项目中更推荐继续升级为实验 E：
+
+```text
+freeQueue 保存空闲消息块指针
+dataQueue 保存待处理消息块指针
+```
+
+也就是用静态消息池管理多个消息对象，确保每个消息对象同一时间只被一个任务拥有。
+
 ## 任务状态变化
 
 ### PUT 模式
@@ -407,7 +569,7 @@ if (status != osOK)
 
 ### 队列传值和传指针不同
 
-当前实验传递的是结构体副本。后续如果传递指针，必须保证：
+实验 C 传递的是结构体副本，实验 D 传递的是指针。传递指针时必须保证：
 
 - 不能发送局部变量地址；
 - 指针指向的数据生命周期足够长；
@@ -435,12 +597,23 @@ cmake --build --preset Debug
 7. 分析任务是否阻塞、唤醒和重新运行。
 ```
 
+实验 D 的验证流程：
+
+```text
+1. 编译工程。
+2. 烧录 STM32F407。
+3. 打开串口。
+4. 观察 put_addr、get_addr、static_addr。
+5. 确认三个地址一致。
+6. 观察消费者是否能通过指针读到正确的 seq 和 tick。
+```
+
 ## 当前章节后续方向
 
-完成队列 timeout 实验后，建议继续学习：
+完成队列 timeout 和指针传递实验后，建议继续学习：
 
-1. 队列传指针与消息生命周期；
-2. 静态消息池和内存池；
+1. 静态消息池和内存池；
+2. 双队列管理消息块所有权；
 3. 中断中发送队列消息；
 4. xQueueSendFromISR() 与 CMSIS-RTOS2 ISR 限制；
 5. 队列、信号量、互斥量、事件标志和任务通知的区别；
@@ -448,4 +621,4 @@ cmake --build --preset Debug
 
 ## 总结
 
-队列不仅是存放消息的数组，也是任务之间进行数据传递和同步等待的机制。timeout 决定任务在资源不可用时是立即失败、等待一段时间，还是一直阻塞。
+队列不仅是存放消息的数组，也是任务之间进行数据传递和同步等待的机制。timeout 决定任务在资源不可用时是立即失败、等待一段时间，还是一直阻塞。传递指针时，队列只负责搬运地址，消息对象的生命周期和所有权需要由程序自己保证。
