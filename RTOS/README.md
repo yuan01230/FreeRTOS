@@ -210,17 +210,27 @@ GET + timeout=500
 GET + timeout=2000
 ```
 
-### 实验 D：当前程序
+### 实验 D：队列传递指针
 
-当前 `LIB/App_FreeRtos/app_freertos.c` 已切换为实验 D：队列传递指针。
+实验 D 已验证队列可以保存 `AppQueueMessage_t *` 指针。
 
-当前程序不再通过 `APP_QUEUE_TEST_MODE` 切换 PUT / GET timeout 测试，而是固定运行：
+实验 D 固定运行：
 
 ```text
 实验 D：生产者发送 AppQueueMessage_t *，消费者接收 AppQueueMessage_t *
 ```
 
-如需回看实验 C，不需要重新做实验；本 README 已保留实验 C 的六组测试结果和分析。
+### 实验 E：当前程序
+
+当前 `LIB/App_FreeRtos/app_freertos.c` 已切换为实验 E：静态消息池 + 双队列。
+
+当前程序固定运行：
+
+```text
+实验 E：freeQueue 保存空闲消息块，dataQueue 保存待处理消息块
+```
+
+如需回看实验 C/D，不需要重新做实验；本 README 已保留前面实验的测试结果和分析。
 
 ## PUT 实验：队列满时的 timeout
 
@@ -477,6 +487,206 @@ dataQueue 保存待处理消息块指针
 
 也就是用静态消息池管理多个消息对象，确保每个消息对象同一时间只被一个任务拥有。
 
+## 实验 E：静态消息池 + 双队列
+
+### 实验目的
+
+实验 D 使用一个 `staticMessage` 传递指针，生命周期是安全的，但它只有一个消息对象。
+
+如果生产者很快、消费者很慢，生产者下一轮可能覆盖消费者还没处理完的数据。实验 E 使用多个静态消息块和两个队列解决这个问题。
+
+核心目标：
+
+- 不使用 `malloc`，所有消息对象静态分配；
+- 队列只传递消息块指针；
+- 用 `freeQueue` 管理空闲消息块；
+- 用 `dataQueue` 管理待处理消息块；
+- 每个消息块同一时间只属于一个位置。
+
+### 当前实验设计
+
+消息池大小：
+
+```c
+#define APP_MESSAGE_POOL_SIZE 3U
+```
+
+静态消息池：
+
+```c
+static AppQueueMessage_t messagePool[APP_MESSAGE_POOL_SIZE];
+```
+
+两个队列：
+
+```c
+freeQueueHandle = osMessageQueueNew(APP_MESSAGE_POOL_SIZE,
+                                    sizeof(AppQueueMessage_t *),
+                                    NULL);
+
+dataQueueHandle = osMessageQueueNew(APP_MESSAGE_POOL_SIZE,
+                                    sizeof(AppQueueMessage_t *),
+                                    NULL);
+```
+
+初始化时，把 3 个消息块地址全部放入 `freeQueue`：
+
+```text
+freeQueue: block0, block1, block2
+dataQueue: empty
+```
+
+### 消息块所有权流转
+
+```text
+freeQueue
+   ↓ alloc：生产者取出空闲块
+生产者填写消息
+   ↓ put：生产者放入待处理队列
+dataQueue
+   ↓ get：消费者取出待处理块
+消费者处理消息
+   ↓ free：消费者归还空闲块
+freeQueue
+```
+
+这个流程的关键点是：消费者没有归还消息块之前，生产者不会再次拿到这个块，因此不会覆盖消费者正在处理的数据。
+
+### 当前参数
+
+```c
+#define APP_MESSAGE_POOL_SIZE       3U
+#define APP_PRODUCER_PERIOD_TICKS   500U
+#define APP_CONSUMER_WORK_TICKS     1500U
+#define APP_POOL_WAIT_TICKS         1000U
+```
+
+含义：
+
+- 消息池有 3 个静态消息块。
+- 生产者每 500 tick 尝试产生一条消息。
+- 消费者处理一条消息需要 1500 tick。
+- 如果没有空闲块，生产者最多等待 1000 tick。
+
+当前配置故意让生产者比消费者快，便于观察消息块被逐渐占用、再被消费者归还的过程。
+
+### 预期串口日志
+
+典型日志格式：
+
+```text
+[pool] experiment E start: static message pool + double queues
+[pool] flow: freeQueue -> producer -> dataQueue -> consumer -> freeQueue
+[pool] op=init id=- seq=- status=osOK free=3 data=0
+[pool] op=alloc id=0 seq=0 status=osOK free=2 data=0
+[pool] op=put id=0 seq=1 status=osOK free=2 data=1
+[pool] op=get id=0 seq=1 status=osOK free=2 data=0
+[pool] op=free id=0 seq=1 status=osOK free=3 data=0
+```
+
+日志字段：
+
+| 字段 | 含义 |
+| --- | --- |
+| `op=init` | 消息池初始化完成 |
+| `op=alloc` | 生产者从 `freeQueue` 申请空闲块 |
+| `op=put` | 生产者把填好的消息块放入 `dataQueue` |
+| `op=get` | 消费者从 `dataQueue` 取出消息块 |
+| `op=free` | 消费者处理完成后把消息块归还 `freeQueue` |
+| `id` | 消息块编号，固定属于某个静态块 |
+| `seq` | 消息序号 |
+| `free` | `freeQueue` 中空闲块数量 |
+| `data` | `dataQueue` 中待处理块数量 |
+
+### 可能观察到的现象
+
+如果消费者较慢，生产者可能遇到 `freeQueue` 为空：
+
+```text
+[pool] op=alloc id=- seq=- status=osErrorTimeout free=0 data=3
+```
+
+这表示所有消息块都在 `dataQueue` 或消费者手中，生产者等待 `APP_POOL_WAIT_TICKS` 后仍然没有拿到空闲块。
+
+这个现象不是错误，而是实验 E 要观察的重点：没有空闲消息块时，生产者不会覆盖正在使用的数据。
+
+### 实测串口结果
+
+本次实测回显：
+
+```text
+[pool] experiment E start: static message pool + double queues
+[pool] flow: freeQueue -> producer -> dataQueue -> consumer -> freeQueue
+[pool] op=init id=- seq=- status=osOK free=3 data=0
+
+[pool] op=alloc id=0 seq=0 status=osOK free=2 data=0
+[pool] op=put id=0 seq=1 status=osOK free=2 data=1
+[pool] op=get id=0 seq=1 status=osOK free=2 data=0
+
+[pool] op=alloc id=1 seq=0 status=osOK free=1 data=0
+[pool] op=put id=1 seq=2 status=osOK free=1 data=1
+
+[pool] op=alloc id=2 seq=0 status=osOK free=0 data=1
+[pool] op=put id=2 seq=3 status=osOK free=0 data=2
+
+[pool] op=free id=0 seq=1 status=osOK free=1 data=2
+[pool] op=get id=1 seq=2 status=osOK free=1 data=1
+[pool] op=alloc id=0 seq=1 status=osOK free=0 data=1
+[pool] op=put id=0 seq=4 status=osOK free=0 data=2
+
+[pool] op=alloc id=1 seq=2 status=osOK free=0 data=2
+[pool] op=put id=1 seq=5 status=osOK free=0 data=3
+[pool] op=free id=1 seq=5 status=osOK free=0 data=3
+[pool] op=get id=2 seq=3 status=osOK free=0 data=2
+
+[pool] op=alloc id=- seq=- status=osErrorTimeout free=0 data=2
+[pool] op=free id=2 seq=3 status=osOK free=1 data=2
+[pool] op=get id=0 seq=4 status=osOK free=1 data=1
+
+[pool] op=alloc id=2 seq=3 status=osOK free=0 data=1
+[pool] op=put id=2 seq=6 status=osOK free=0 data=2
+
+[pool] op=alloc id=0 seq=4 status=osOK free=0 data=2
+[pool] op=put id=0 seq=7 status=osOK free=0 data=3
+[pool] op=free id=0 seq=7 status=osOK free=0 data=3
+[pool] op=get id=1 seq=5 status=osOK free=0 data=2
+```
+
+实测结论：
+
+- `init` 时 `free=3 data=0`，说明 3 个静态消息块都已经进入空闲队列。
+- `alloc id=0/1/2` 依次出现，说明生产者从 `freeQueue` 中逐个申请消息块。
+- `put` 后 `data` 增加，`get` 后 `data` 减少，说明 `dataQueue` 正在保存待处理消息块指针。
+- `free` 后空闲块会重新回到 `freeQueue`，随后生产者可以再次 `alloc` 同一个 `id`。
+- `op=alloc id=- status=osErrorTimeout free=0` 表示消息池已经没有空闲块，生产者等待后仍未拿到空闲块，因此本轮不覆盖任何正在使用的消息块。
+
+这组结果证明实验 E 的核心机制成立：消息块通过 `freeQueue -> producer -> dataQueue -> consumer -> freeQueue` 流转，没有空闲块时生产者不会强行覆盖旧数据。
+
+### 实测中需要注意的日志现象
+
+本次回显中有一类很值得注意的现象：
+
+```text
+[pool] op=get id=1 seq=2 status=osOK ...
+[pool] op=put id=1 seq=5 status=osOK ...
+[pool] op=free id=1 seq=5 status=osOK ...
+```
+
+从所有权角度看，消费者取到的是 `id=1 seq=2`，处理完成后归还的也应该是这块消息对象。但 `free` 行打印成了 `seq=5`。
+
+原因是当前程序在消费者执行 `osMessageQueuePut(freeQueueHandle, &message_ptr, 0U, 0U)` 归还消息块之后，才打印 `free` 日志。归还后，这个消息块已经重新属于 `freeQueue`，生产者可能立刻抢先取走并改写 `sequence`。消费者随后打印日志时读到的就是被复用后的新 `seq`。
+
+因此，这不是消息池流转失败，而是日志打印时机带来的观察误差。后续可以把 `id/seq` 在归还前保存为快照，或者先打印“准备归还”再放回 `freeQueue`，让日志更严谨。
+
+### 实验 E 相比实验 D 的改进
+
+| 项目 | 实验 D | 实验 E |
+| --- | --- | --- |
+| 消息对象数量 | 1 个静态对象 | 3 个静态消息块 |
+| 队列数量 | 1 个数据队列 | 1 个空闲队列 + 1 个数据队列 |
+| 是否管理所有权 | 没有显式管理 | 通过双队列管理 |
+| 消费慢时的风险 | 可能被覆盖 | 没有空闲块时生产者等待或超时 |
+
 ## 任务状态变化
 
 ### PUT 模式
@@ -608,17 +818,27 @@ cmake --build --preset Debug
 6. 观察消费者是否能通过指针读到正确的 seq 和 tick。
 ```
 
+实验 E 的验证流程：
+
+```text
+1. 编译工程。
+2. 烧录 STM32F407。
+3. 打开串口。
+4. 观察 init 时 free=3、data=0。
+5. 观察 alloc、put、get、free 的顺序。
+6. 确认消费者 free 后，空闲块数量会增加。
+7. 如果出现 osErrorTimeout，确认它发生在 free=0 时，表示生产者没有空闲块可用。
+```
+
 ## 当前章节后续方向
 
-完成队列 timeout 和指针传递实验后，建议继续学习：
+完成队列 timeout、指针传递和静态消息池实验后，建议继续学习：
 
-1. 静态消息池和内存池；
-2. 双队列管理消息块所有权；
-3. 中断中发送队列消息；
-4. xQueueSendFromISR() 与 CMSIS-RTOS2 ISR 限制；
-5. 队列、信号量、互斥量、事件标志和任务通知的区别；
-6. Stream Buffer/Ring Buffer 处理连续串口字节流。
+1. 中断中发送队列消息；
+2. xQueueSendFromISR() 与 CMSIS-RTOS2 ISR 限制；
+3. 队列、信号量、互斥量、事件标志和任务通知的区别；
+4. Stream Buffer/Ring Buffer 处理连续串口字节流。
 
 ## 总结
 
-队列不仅是存放消息的数组，也是任务之间进行数据传递和同步等待的机制。timeout 决定任务在资源不可用时是立即失败、等待一段时间，还是一直阻塞。传递指针时，队列只负责搬运地址，消息对象的生命周期和所有权需要由程序自己保证。
+队列不仅是存放消息的数组，也是任务之间进行数据传递和同步等待的机制。timeout 决定任务在资源不可用时是立即失败、等待一段时间，还是一直阻塞。传递指针时，队列只负责搬运地址，消息对象的生命周期和所有权需要由程序自己保证。实验 E 通过静态消息池和双队列，把“谁正在拥有消息块”这件事显式管理起来。
